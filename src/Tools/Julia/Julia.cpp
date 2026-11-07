@@ -55,7 +55,7 @@ module StreamPU
   # Native C API calls (jl_call) do not automatically propagate Julia exceptions to C++.
   # safe_call executes f(args...) in a try/catch block, formats the full backtrace
   # on failure, and stores the tuple (result, exception_occurred, exception, backtrace)
-  # into ref[]. C++ inspects this tuple and throws a spu::tools::runtime_error if needed.
+  # into ref[]. C++ inspects this tuple and throws a spu::tools::julia_error if needed.
   function safe_call(ref::Ref{Any}, f::Function, args...)
     res::Any = undef
     backtrace::String = ""
@@ -82,16 +82,16 @@ jl_function_t* Julia::safe_call_func = nullptr;
 jl_function_t* Julia::mk_ref_func = nullptr;
 jl_function_t* Julia::call_func_handle = nullptr;
 bool Julia::is_initialized = false;
-size_t Julia::n_proxies = 256;
+size_t Julia::n_proxies_init = 256;
 
 static std::mutex julia_eval_mutex;
 
 void
-Julia::init(const uint64_t n_proxies)
+Julia::init(const uint64_t n_proxies_init)
 {
     if (Julia::is_initialized) return;
 
-    Julia::n_proxies = n_proxies;
+    Julia::n_proxies_init = n_proxies_init;
 
     // Preserve any pre-existing SIGINT handler (e.g. spu::tools::Signal_handler) across jl_init(),
     // which otherwise overwrites SIGINT with Julia's internal signal handler.
@@ -119,7 +119,7 @@ Julia::init(const uint64_t n_proxies)
     Julia::mk_ref_func = jl_get_function(Julia::module, "mk_ref");
     Julia::call_func_handle = jl_get_function(Julia::module, "call");
 
-    Ref_keeper::init(n_proxies);
+    Ref_keeper::init(n_proxies_init);
 
 #if defined(_WIN64) || defined(_WIN32)
     if (restore_sigint && prev_sigint != SIG_ERR && prev_sigint != SIG_DFL && prev_sigint != SIG_IGN)
@@ -150,9 +150,15 @@ Julia::is_init()
 }
 
 size_t
+Julia::get_n_proxies_init()
+{
+    return Julia::n_proxies_init;
+}
+
+size_t
 Julia::get_n_proxies()
 {
-    return Julia::n_proxies;
+    return Ref_keeper::get()->get_size();
 }
 
 jl_module_t*

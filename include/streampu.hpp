@@ -195,6 +195,9 @@
 #ifndef INVALID_ARGUMENT_HPP_
 #include <Tools/Exception/invalid_argument/invalid_argument.hpp>
 #endif
+#ifndef JULIA_ERROR_HPP_
+#include <Tools/Exception/julia_error/julia_error.hpp>
+#endif
 #ifndef LENGTH_ERROR_HPP_
 #include <Tools/Exception/length_error/length_error.hpp>
 #endif

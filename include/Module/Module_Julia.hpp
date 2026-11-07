@@ -31,12 +31,40 @@ namespace module
 class Module_Julia
 {
   protected:
+    /*!
+     * \brief Per-socket cache of GC-rooted 1D Julia `Array` (`Vector{T}`) views wrapping C++ socket buffers.
+     *
+     * Avoids calling `jl_apply_array_type()`, `jl_ptr_to_array_1d()`, and `Ref_keeper::mark()`/`unmark()` on every
+     * codelet execution when socket buffer addresses (`dataptr`) remain unchanged or cycle through a fixed set of
+     * addresses (such as multi-wave execution `w = 0..W-1` or Pipeline adaptor double-buffers).
+     */
+    struct Socket_jl_cache
+    {
+        jl_value_t* array_type = nullptr; //!< Cached `Vector{T}` Julia `DataType` resolved once in `eval()`.
+        void* last_dataptr =
+          nullptr;                 //!< Fast-path check: last C++ buffer pointer bound to `func_args` for this socket.
+        size_t last_databytes = 0; //!< Fast-path check: last socket byte size.
+        size_t last_n_frames_per_wave = 0; //!< Fast-path check: last `n_frames_per_wave` value.
+        size_t last_hit_idx =
+          0; //!< Index of the most recently matched entry in `entries` (for O(1) cyclic prediction).
+        size_t next_evict_idx = 0; //!< Round-robin (FIFO) replacement cursor when `entries.size() == max_entries`.
+        struct Entry
+        {
+            void* dataptr;        //!< Wrapped C++ buffer base pointer.
+            size_t n_elmts;       //!< Number of elements in the 1D Julia array view.
+            jl_value_t* jl_array; //!< Pointer to the 1D Julia `Array` object (`jl_array_t*`).
+            size_t jl_id;         //!< Slot index in the owning thread's `Ref_keeper` keeping `jl_array` GC-rooted.
+        };
+        std::vector<Entry> entries; //!< Cached `(dataptr, n_elmts) -> jl_array` descriptors for this socket.
+    };
+
     Module* self_module;
     Module_Julia& (*to_module_julia)(Module&);
     std::vector<jl_value_t*> jl_states_ptr;
     std::vector<size_t> jl_states_id;
     std::vector<std::vector<jl_value_t*>> jl_constants_ptr;
     std::vector<std::vector<size_t>> jl_constants_id;
+    std::vector<std::vector<Socket_jl_cache>> jl_sockets_cache;
     std::vector<std::vector<void*>> jl_func_args;
     bool evaluated;
     // Address of the thread_local Ref_keeper singleton that evaluated this module instance (set in eval()).
@@ -105,7 +133,9 @@ class Module_Julia
     const std::vector<jl_value_t*>& _get_states() const;
 
     static size_t get_task_id(runtime::Task& task);
+    static jl_value_t* get_jl_datatype(const runtime::Socket* sck);
     static tools::Proxy jl_new_array_from_data(const runtime::Socket* sck, size_t n_elmts);
+    jl_value_t* get_or_create_socket_array(const size_t tid, const size_t s, void* p, const size_t n_elmts);
 };
 }
 }

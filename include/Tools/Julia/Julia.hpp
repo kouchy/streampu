@@ -42,7 +42,7 @@ class Julia
     static jl_function_t* mk_ref_func;
     static jl_function_t* call_func_handle;
     static bool is_initialized;
-    static size_t n_proxies;
+    static size_t n_proxies_init;
 
   public:
     // =========================================================================
@@ -55,9 +55,11 @@ class Julia
      * If the Julia engine is not already started, it calls `jl_init()`. It then compiles internal
      * helper functions for GC rooting and exception handling, and initializes the calling thread's Ref_keeper.
      *
-     * \param n_proxies Maximum number of simultaneously preserved GC references per thread (defaults to 256).
+     * \param n_proxies_init Initial capacity of simultaneously preserved GC references per thread (defaults to 256).
+     *                       If a thread exceeds this initial capacity at runtime, its GC root frame is automatically
+     *                       reallocated with double the capacity (2x, 4x, etc.).
      */
-    static void init(const uint64_t n_proxies = 256);
+    static void init(const uint64_t n_proxies_init = 256);
 
     /*!
      * \brief Shuts down the Julia runtime and invokes all registered exit hooks.
@@ -74,9 +76,17 @@ class Julia
     static bool is_init();
 
     /*!
-     * \brief Returns the maximum number of GC references tracked per thread configured at initialization.
+     * \brief Returns the initial number of GC references tracked per thread configured at `Julia::init()`.
      *
-     * \return The configured capacity (`n_proxies`).
+     * \return The configured initial capacity (`n_proxies_init`).
+     */
+    static size_t get_n_proxies_init();
+
+    /*!
+     * \brief Returns the current GC reference capacity allocated for the calling thread's `Ref_keeper` frame
+     *        (initially equal to `get_n_proxies_init()`, and doubled each time the frame grows).
+     *
+     * \return The calling thread's current `Ref_keeper` capacity.
      */
     static size_t get_n_proxies();
 
@@ -273,7 +283,7 @@ class Julia
      * \param f Pointer to the target Julia function (`jl_function_t*`).
      * \param args Array of pointers to Julia value arguments (`jl_value_t**`).
      * \param n Number of arguments in `args`.
-     * \param safe If `true`, intercepts any Julia exception and throws a `spu::tools::runtime_error`
+     * \param safe If `true`, intercepts any Julia exception and throws a `spu::tools::julia_error`
      *             with the full Julia backtrace. If `false`, calls Julia directly without try/catch overhead.
      * \return The result of the function execution (`jl_value_t*`), rooted in the current thread's frame.
      */

@@ -160,7 +160,7 @@ Thread_pool_Julia::_start_thread(const size_t tid)
         std::lock_guard<std::mutex> adopt_lock(Thread_pool_Julia::jl_adopt_mutex);
         jl_gcframe_t** gc_struct = jl_adopt_thread();
         (void)gc_struct;
-        if (Julia::is_init()) Ref_keeper::init(Julia::get_n_proxies());
+        if (Julia::is_init()) Ref_keeper::init(Julia::get_n_proxies_init());
     }
 
     {

@@ -34,7 +34,7 @@ using namespace spu;
 int main(int argc, char** argv)
 {
     tools::Signal_handler::init();
-    tools::Julia::init(256); // starts libjulia if needed and allocates 256 GC root slots per thread
+    tools::Julia::init(256); // starts libjulia if needed and allocates 256 initial GC root slots per thread
 
     // ... build and execute StreamPU sequences or pipelines ...
 
@@ -44,11 +44,16 @@ int main(int argc, char** argv)
 ```
 
 !!! note
-    `tools::Julia::init()` automatically calls `jl_init()` if the Julia engine
-    is not already running, compiles `StreamPU`'s internal GC-rooting helpers,
-    and **preserves any pre-existing `SIGINT` handler** (such as
-    `tools::Signal_handler::init()`) so `Ctrl+C` cleanly interrupts running
-    sequences and pipelines.
+    `tools::Julia::init(n_proxies_init)` automatically calls `jl_init()` if the
+    Julia engine is not already running, compiles `StreamPU`'s internal
+    GC-rooting helpers, and **preserves any pre-existing `SIGINT` handler**
+    (such as `tools::Signal_handler::init()`) so `Ctrl+C` cleanly interrupts
+    running sequences and pipelines. The `n_proxies_init` parameter (`256` by
+    default, queried via `tools::Julia::get_n_proxies_init()`) sets the
+    **initial** number of GC root slots allocated per thread; if a thread
+    exceeds this capacity at runtime, its GC root frame is automatically
+    reallocated with double the capacity ($2\times$, $4\times$, etc., with the
+    current thread's capacity queried via `tools::Julia::get_n_proxies()`).
 
 ---
 
@@ -191,13 +196,17 @@ filter.create_codelet(t, R""""(
 
 #### Safe vs. Unsafe Invocation (`set_jl_safety`)
 
-- **`mod.set_jl_safety(true)`** *(default)*: Invokes codelets inside a Julia
-  `try ... catch` wrapper (`StreamPU.safe_call`). Any uncaught Julia exception
-  is formatted with its full Julia stacktrace and rethrown in C++ as a
-  `spu::tools::runtime_error`. Recommended during development and debugging.
-- **`mod.set_jl_safety(false)`**: Calls `jl_call` directly without exception
-  wrapping, reducing C++-to-Julia call overhead below ~100 ns. Recommended for
-  validated hot loops and benchmarks.
+- **`mod.set_jl_safety(true)`** *(default)*: Invokes codelets through a
+  specialized `@cfunction` `try ... catch` trampoline (or `StreamPU.safe_call`
+  if compiled without `SPU_JULIA_TRAMPOLINE`) with ~40 ns call overhead. Any
+  uncaught Julia exception is formatted with its full Julia stacktrace and
+  rethrown in C++ as a `spu::tools::julia_error`. Recommended during
+  development and debugging.
+- **`mod.set_jl_safety(false)`**: Invokes codelets through a specialized
+  `@cfunction` native C trampoline (or `jl_call` if compiled without
+  `SPU_JULIA_TRAMPOLINE`) using cached zero-copy socket `Array` descriptors without
+  exception wrapping, reducing C++-to-Julia call overhead to ~30 ns. Recommended
+  for validated hot loops and benchmarks.
 
 ---
 

@@ -65,6 +65,7 @@ class SPU_EXPORT_EXCEPTION exception : public std::exception
 #include "Tools/Exception/control_flow_error/control_flow_error.hpp"
 #include "Tools/Exception/domain_error/domain_error.hpp"
 #include "Tools/Exception/invalid_argument/invalid_argument.hpp"
+#include "Tools/Exception/julia_error/julia_error.hpp"
 #include "Tools/Exception/length_error/length_error.hpp"
 #include "Tools/Exception/logic_error/logic_error.hpp"
 #include "Tools/Exception/out_of_range/out_of_range.hpp"
