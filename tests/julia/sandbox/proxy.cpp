@@ -48,17 +48,13 @@ main(int argc, char** argv)
 {
     printf("pid: %d\n", getpid()); // to kill if necessary
 
-    option longopts[] = { { "threads", required_argument, NULL, 't' }, { "thread-pool", required_argument, NULL, 'V' },
-                          { "seed", required_argument, NULL, 's' },    { "print-stats", no_argument, NULL, 'p' },
-                          { "verbose", no_argument, NULL, 'v' },       { "debug", no_argument, NULL, 'g' },
+    option longopts[] = { { "threads", required_argument, NULL, 't' }, { "seed", required_argument, NULL, 's' },
+                          { "print-stats", no_argument, NULL, 'p' },   { "verbose", no_argument, NULL, 'v' },
                           { "help", no_argument, NULL, 'h' },          { 0 } };
 
     size_t n_threads = std::thread::hardware_concurrency();
     bool print_stats = false;
-    bool debug = false;
     bool verbose = false;
-    bool jl_safe = false;
-    int tp_version = 0;
     std::hash<std::string> hash;
     unsigned seed = 0;
 
@@ -79,12 +75,6 @@ main(int argc, char** argv)
                 break;
             case 'v':
                 verbose = true;
-                break;
-            case 'g':
-                debug = true;
-                break;
-            case 'V':
-                tp_version = atoi(optarg);
                 break;
             case 'h':
                 std::cout << "usage: " << argv[0] << " [options]" << std::endl;
@@ -133,13 +123,11 @@ main(int argc, char** argv)
     jl_value_t* datatype = jl_apply_array_type((jl_value_t*)jl_eval_string("return UInt64"), 1);
     jl_array_t* jl_array = jl_ptr_to_array_1d(datatype, array.data(), array.size(), 0);
 
-    jl_function_t* jl_get_threadid = jl_eval_string("return Base.Threads.threadid");
-    jl_function_t* jl_println = jl_eval_string("return Base.println");
     (void)spu::tools::Julia::eval_file("../tests/julia/sandbox/computations.jl");
 
     spu::tools::Proxy computation = jl_eval_string("return computation1");
     std::function<void(std::vector<uint64_t>&, int, const size_t)> func_exec =
-      [computation, jl_array, jl_println, print_stats, verbose](std::vector<uint64_t>& res, int i, const size_t tid)
+      [computation, jl_array, print_stats, verbose](std::vector<uint64_t>& res, int i, const size_t tid)
     {
         if (verbose)
         {
