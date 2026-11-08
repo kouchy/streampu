@@ -30,7 +30,29 @@ namespace module
  */
 class Module_Julia
 {
-  protected:
+  public:
+    static constexpr size_t SPU_MAX_INLINE_TASKS = 8;
+    static constexpr size_t SPU_MAX_FAST_SOCKETS = 8;
+
+    /*!
+     * \brief Shared `@cfunction` compilation state across a prototype task and all of its thread clones.
+     */
+    struct Shared_trampoline
+    {
+        std::atomic<bool> compiled{ false };
+        std::atomic<void*> unsafe_cfunc{ nullptr };
+        std::atomic<void*> safe_cfunc{ nullptr };
+    };
+
+    /*!
+     * \brief 16-byte hot descriptor per socket stored inline inside `Task_jl_cache` for O(1) unrolled pointer checks.
+     */
+    struct Socket_fast_check
+    {
+        const runtime::Socket* sck = nullptr;
+        void* last_dataptr = nullptr;
+    };
+
     /*!
      * \brief Per-socket cache of GC-rooted 1D Julia `Array` (`Vector{T}`) views wrapping C++ socket buffers.
      *
@@ -40,11 +62,11 @@ class Module_Julia
      */
     struct Socket_jl_cache
     {
+        const runtime::Socket* sck = nullptr;
         jl_value_t* array_type = nullptr; //!< Cached `Vector{T}` Julia `DataType` resolved once in `eval()`.
         void* last_dataptr =
-          nullptr;                 //!< Fast-path check: last C++ buffer pointer bound to `func_args` for this socket.
-        size_t last_databytes = 0; //!< Fast-path check: last socket byte size.
-        size_t last_n_frames_per_wave = 0; //!< Fast-path check: last `n_frames_per_wave` value.
+          nullptr;                   //!< Fast-path check: last C++ buffer pointer bound to `func_args` for this socket.
+        size_t n_elmts_per_wave = 0; //!< Precomputed element count per wave (`sck->get_n_elmts() * nfw / n_frames`).
         size_t last_hit_idx =
           0; //!< Index of the most recently matched entry in `entries` (for O(1) cyclic prediction).
         size_t next_evict_idx = 0; //!< Round-robin (FIFO) replacement cursor when `entries.size() == max_entries`.
@@ -58,14 +80,44 @@ class Module_Julia
         std::vector<Entry> entries; //!< Cached `(dataptr, n_elmts) -> jl_array` descriptors for this socket.
     };
 
+    /*!
+     * \brief Per-task execution cache. The first 8 tasks (`tid < SPU_MAX_INLINE_TASKS`) reside directly inside
+     *        `Module_Julia::inline_tasks_cache[tid]` at a constant byte offset from `Module&`, allowing the codelet
+     *        lambda to fit in an 8-byte `std::function` SBO capture and resolve `Task_jl_cache*` in a single `add`.
+     */
+    struct Task_jl_cache
+    {
+        // Hot fields accessed on every codelet execution (packed into the leading cache lines):
+        void* unsafe_cfunc = nullptr;
+        void** func_args_ptr = nullptr;
+        size_t last_n_frames = 0;
+        size_t last_n_frames_per_wave = 0;
+        Socket_fast_check fast_scks[SPU_MAX_FAST_SOCKETS];
+        void* safe_cfunc = nullptr;
+        bool jl_safe = true;
+
+        // Cold/metadata fields accessed only during `eval()` or on cache miss (`slow_exec_codelet`):
+        Module_Julia* owner = nullptr;
+        size_t tid = 0;
+        size_t n_scks = 0;
+        size_t first_sck_arg = 0;
+        size_t n_obj_args = 0;
+        size_t expected_n_obj_args = 0;
+        bool fixed_arity_valid = false;
+        std::shared_ptr<Shared_trampoline> shared_trampoline;
+        std::vector<Socket_jl_cache> sockets;
+        std::vector<void*> func_args;
+    };
+
+  protected:
     Module* self_module;
     Module_Julia& (*to_module_julia)(Module&);
+    Task_jl_cache inline_tasks_cache[SPU_MAX_INLINE_TASKS];
+    std::vector<Task_jl_cache> extra_tasks_cache;
     std::vector<jl_value_t*> jl_states_ptr;
     std::vector<size_t> jl_states_id;
     std::vector<std::vector<jl_value_t*>> jl_constants_ptr;
     std::vector<std::vector<size_t>> jl_constants_id;
-    std::vector<std::vector<Socket_jl_cache>> jl_sockets_cache;
-    std::vector<std::vector<void*>> jl_func_args;
     bool evaluated;
     // Address of the thread_local Ref_keeper singleton that evaluated this module instance (set in eval()).
     // In multi-threaded Sequences and Pipelines, cloned Stateful_Julia / Stateless_Julia modules are evaluated on their
@@ -115,6 +167,14 @@ class Module_Julia
     void create_codelet_function(runtime::Task& task, jl_function_t* f);
 
     void eval();
+
+    inline Task_jl_cache& get_task_cache(const size_t tid)
+    {
+        return (tid < SPU_MAX_INLINE_TASKS) ? this->inline_tasks_cache[tid]
+                                            : this->extra_tasks_cache[tid - SPU_MAX_INLINE_TASKS];
+    }
+
+    static int slow_exec_codelet(Task_jl_cache* tcache, const size_t frame_id);
 
   protected:
     void deep_copy(const Module_Julia& m, Module* self_module);
