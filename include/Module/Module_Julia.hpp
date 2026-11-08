@@ -33,6 +33,7 @@ class Module_Julia
   public:
     static constexpr size_t SPU_MAX_INLINE_TASKS = 8;
     static constexpr size_t SPU_MAX_FAST_SOCKETS = 8;
+    static constexpr size_t SPU_MAX_DIRECT_TRAMPOLINE_ARGS = 16;
 
     /*!
      * \brief Shared `@cfunction` compilation state across a prototype task and all of its thread clones.
@@ -196,6 +197,21 @@ class Module_Julia
     static jl_value_t* get_jl_datatype(const runtime::Socket* sck);
     static tools::Proxy jl_new_array_from_data(const runtime::Socket* sck, size_t n_elmts);
     jl_value_t* get_or_create_socket_array(const size_t tid, const size_t s, void* p, const size_t n_elmts);
+
+  private:
+    // Compile-time arity specialization helpers using C++11 tag dispatch (std::true_type / std::false_type) so the
+    // raw codelet lambda is passed directly to Module::create_codelet(task, lambda) without intermediate std::function
+    // type erasure.
+    template<size_t N_SCKS, size_t I = N_SCKS>
+    void bind_fast_codelet_arity(runtime::Task& task,
+                                 const ptrdiff_t tcache_offset,
+                                 const size_t expected_n_obj_args,
+                                 std::false_type);
+    template<size_t N_SCKS, size_t I = N_SCKS>
+    void bind_fast_codelet_arity(runtime::Task& task,
+                                 const ptrdiff_t tcache_offset,
+                                 const size_t expected_n_obj_args,
+                                 std::true_type = std::true_type());
 };
 }
 }

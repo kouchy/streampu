@@ -188,5 +188,25 @@ Module::is_single_wave() const
     return this->single_wave;
 }
 
+template<typename F,
+         typename std::enable_if<!std::is_same<typename std::decay<F>::type,
+                                               std::function<int(Module&, runtime::Task&, const size_t)>>::value,
+                                 int>::type>
+inline void
+Module::create_codelet(runtime::Task& task, F&& codelet)
+{
+    task.create_codelet(std::forward<F>(codelet));
+}
+
+template<typename F,
+         typename std::enable_if<!std::is_same<typename std::decay<F>::type,
+                                               std::function<int(Module&, runtime::Task&, const size_t)>>::value,
+                                 int>::type>
+inline void
+Module::create_cdl(runtime::Task& task, F&& codelet)
+{
+    this->create_codelet(task, std::forward<F>(codelet));
+}
+
 }
 }

@@ -10,7 +10,9 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <new>
 #include <string>
+#include <type_traits>
 #include <typeindex>
 #include <unordered_map>
 #include <vector>
@@ -34,6 +36,7 @@ class Buffer_allocator;
 namespace runtime
 {
 class Socket;
+class Sequence;
 class Pipeline;
 
 enum status_t : int
@@ -77,12 +80,23 @@ class Task
 {
 #ifndef DOXYGEN_SHOULD_SKIP_THIS
     friend Socket;
+    friend Sequence;
     friend Pipeline;
     friend module::Module;
     friend tools::Buffer_allocator;
 #endif
 
   protected:
+    // Flat C function pointer signature for fast codelet dispatch.
+    // Unlike std::function<int(Module&, Task&, const size_t)>, which passes value parameters (const size_t) by
+    // rvalue reference (unsigned long&&) across its virtual call and forces frame_id onto the stack, codelet_fn_t
+    // passes frame_id directly by value in a CPU register without any nullptr check or vtable indirection.
+    using codelet_sig_t = int(const void*, module::Module&, Task&, size_t);
+    using codelet_fn_t = codelet_sig_t*;
+    // Maximum number of size_t / pointer captures supported in the inline fast codelet buffer (64 * 8 = 512 bytes).
+    static constexpr size_t fast_codelet_max_captures = 64;
+    static constexpr size_t fast_codelet_capacity = fast_codelet_max_captures * sizeof(size_t);
+
     module::Module* module;
     const std::string name;
     bool stats;
@@ -91,10 +105,25 @@ class Task
     bool outbuffers_allocated;
     bool debug_hex;
     bool replicable;
+    // Cached hot-path flags updated whenever fast, stats, debug, n_frames, or n_frames_per_wave change:
+    // - is_single_wave_exec: true when n_frames == n_frames_per_wave (n_waves == 1)
+    // - is_fast_exec:        true when fast && !stats && !debug && is_single_wave_exec
+    bool is_single_wave_exec;
+    bool is_fast_exec;
     int32_t debug_limit;
     uint8_t debug_precision;
     int32_t debug_frame_max;
     std::function<int(module::Module& m, Task& t, const size_t frame_id)> codelet;
+    // Direct function pointer for trivially copyable codelet lambdas (stored in fast_codelet_data).
+    // Falls back to &Task::call_std_function_codelet when a pre-constructed std::function or a large/non-trivially
+    // copyable functor is registered.
+    codelet_fn_t fast_codelet_fn;
+    // Direct pointer to the trailing "status" output socket (this->sockets.back().get()) and the address of its
+    // internal `void* dataptr` field (&this->status_socket->dataptr). Storing `status_dataptr_ptr` allows `Task::exec`
+    // to be inlined in `Task.hxx` (where `Socket` is still an incomplete forward-declared type) and avoids both
+    // `sockets.back()` vector arithmetic and struct offset addition on every task execution.
+    Socket* status_socket;
+    void** status_dataptr_ptr;
     size_t n_input_sockets;
     size_t n_output_sockets;
     size_t n_fwd_sockets;
@@ -119,6 +148,10 @@ class Task
     std::vector<int8_t*> sockets_dataptr_init;
     std::vector<size_t> sockets_databytes_per_frame;
     std::vector<std::vector<int8_t>> sockets_data;
+
+    // Inline storage for trivially copyable codelet lambdas (placed after the hot scalar/vector fields of Task so
+    // the unused tail of the buffer never separates hot fields across L1 cache lines).
+    alignas(double) uint8_t fast_codelet_data[fast_codelet_capacity];
 
   public:
     std::vector<std::shared_ptr<Socket>> fake_input_sockets;
@@ -176,7 +209,7 @@ class Task
     size_t get_n_fwd_sockets() const;
     size_t get_n_static_input_sockets() const;
 
-    const std::vector<int>& exec(const int frame_id = -1, const bool managed_memory = true);
+    inline const std::vector<int>& exec(const int frame_id = -1, const bool managed_memory = true);
 
     inline Socket& operator[](const size_t id);
     Socket& operator[](const std::string& sck_name);
@@ -243,6 +276,12 @@ class Task
 
     void create_codelet(std::function<int(module::Module& m, Task& t, const size_t frame_id)>& codelet);
 
+    template<typename F,
+             typename std::enable_if<!std::is_same<typename std::decay<F>::type,
+                                                   std::function<int(module::Module&, Task&, const size_t)>>::value,
+                                     int>::type = 0>
+    inline void create_codelet(F&& codelet);
+
     void update_n_frames(const size_t old_n_frames, const size_t new_n_frames);
 
     void update_n_frames_per_wave(const size_t old_n_frames_per_wave, const size_t new_n_frames_per_wave);
@@ -253,6 +292,21 @@ class Task
     void deallocate_outbuffers();
 
   private:
+    template<typename DF>
+    static int call_fast_codelet(const void* data, module::Module& m, Task& t, size_t frame_id);
+    static int call_std_function_codelet(const void* data, module::Module& m, Task& t, size_t frame_id);
+    template<typename DF>
+    inline void register_fast_codelet(const DF& codelet, std::true_type);
+    template<typename DF>
+    inline void register_fast_codelet(const DF& codelet, std::false_type);
+    inline void update_fast_exec_flags();
+    const std::vector<int>& _exec_general(const int frame_id, const bool managed_memory);
+    void _exec_slow(const int frame_id, const bool managed_memory);
+    size_t _exec_debug_before();
+    void _exec_debug_after(const size_t max_n_chars);
+    [[noreturn]] void throw_invalid_frame_id(const int frame_id) const;
+    [[noreturn]] void throw_cannot_exec() const;
+
     template<typename T>
     inline Socket& create_2d_socket(const std::string& name,
                                     const size_t n_rows,

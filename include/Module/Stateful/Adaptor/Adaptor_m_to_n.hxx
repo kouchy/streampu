@@ -101,8 +101,13 @@ Adaptor_m_to_n::init()
     for (size_t s = 0; s < this->n_sockets; s++)
         p1s_in.push_back(this->create_socket_in(p1, "in" + std::to_string(s), this->n_elmts[s], this->datatype[s]));
 
+    // Capture the contiguous base socket index `p1s_in0` and count `n_scks` as scalars instead of
+    // `std::vector<size_t> p1s_in` so the lambda is `std::is_trivially_copyable` (16 bytes) and runs through
+    // `Task::call_fast_codelet` without `std::function` overhead.
+    const size_t n_scks = this->n_sockets;
+    const size_t p1s_in0 = n_scks ? p1s_in[0] : 0;
     this->create_codelet(p1,
-                         [p1s_in](Module& m, runtime::Task& t, const size_t frame_id) -> int
+                         [p1s_in0, n_scks](Module& m, runtime::Task& t, const size_t frame_id) -> int
                          {
                              auto& adp = static_cast<Adaptor_m_to_n&>(m);
                              if (adp.is_no_copy_push())
@@ -114,9 +119,9 @@ Adaptor_m_to_n::init()
                              }
                              else
                              {
-                                 std::vector<const int8_t*> sockets_dataptr(p1s_in.size());
-                                 for (size_t s = 0; s < p1s_in.size(); s++)
-                                     sockets_dataptr[s] = t[p1s_in[s]].get_dataptr<const int8_t>();
+                                 std::vector<const int8_t*> sockets_dataptr(n_scks);
+                                 for (size_t s = 0; s < n_scks; s++)
+                                     sockets_dataptr[s] = t[p1s_in0 + s].get_dataptr<const int8_t>();
                                  adp.push(sockets_dataptr, frame_id);
                              }
                              return runtime::status_t::SUCCESS;
@@ -127,8 +132,9 @@ Adaptor_m_to_n::init()
     for (size_t s = 0; s < this->n_sockets; s++)
         p2s_out.push_back(this->create_socket_out(p2, "out" + std::to_string(s), this->n_elmts[s], this->datatype[s]));
 
+    const size_t p2s_out0 = n_scks ? p2s_out[0] : 0;
     this->create_codelet(p2,
-                         [p2s_out](Module& m, runtime::Task& t, const size_t frame_id) -> int
+                         [p2s_out0, n_scks](Module& m, runtime::Task& t, const size_t frame_id) -> int
                          {
                              auto& adp = static_cast<Adaptor_m_to_n&>(m);
                              if (adp.is_no_copy_pull())
@@ -140,9 +146,9 @@ Adaptor_m_to_n::init()
                              }
                              else
                              {
-                                 std::vector<int8_t*> sockets_dataptr(p2s_out.size());
-                                 for (size_t s = 0; s < p2s_out.size(); s++)
-                                     sockets_dataptr[s] = t[p2s_out[s]].get_dataptr<int8_t>();
+                                 std::vector<int8_t*> sockets_dataptr(n_scks);
+                                 for (size_t s = 0; s < n_scks; s++)
+                                     sockets_dataptr[s] = t[p2s_out0 + s].get_dataptr<int8_t>();
                                  adp.pull(sockets_dataptr, frame_id);
                              }
                              return runtime::status_t::SUCCESS;

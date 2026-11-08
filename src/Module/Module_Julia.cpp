@@ -942,32 +942,48 @@ exec_codelet_fixed(Module_Julia::Task_jl_cache* tcache, module::Module& m, const
                              Make_index_seq<N_OBJ_ARGS + 1>{});
 }
 
-using Codelet_fn = std::function<int(module::Module& m, runtime::Task& t, const size_t frame_id)>;
-
-template<size_t N_SCKS, size_t I = N_SCKS>
-static inline typename std::enable_if<(I > SPU_MAX_DIRECT_TRAMPOLINE_ARGS), Codelet_fn>::type
-make_fast_codelet_arity(const ptrdiff_t tcache_offset, const size_t /*expected_n_obj_args*/)
+// C++11 tag-dispatch recursion (std::true_type for I <= SPU_MAX_DIRECT_TRAMPOLINE_ARGS, std::false_type for the base
+// case I > SPU_MAX_DIRECT_TRAMPOLINE_ARGS) that passes the specialized lambda directly to Module::create_codelet(task,
+// lambda) without intermediate std::function type erasure, allowing Task::fast_codelet_fn to bind directly to
+// Task::call_fast_codelet<Lambda>.
+template<size_t N_SCKS, size_t I>
+void
+Module_Julia::bind_fast_codelet_arity(runtime::Task& task,
+                                      const ptrdiff_t tcache_offset,
+                                      const size_t /*expected_n_obj_args*/,
+                                      std::false_type)
 {
-    return [tcache_offset](module::Module& m, runtime::Task& /*t*/, const size_t frame_id) -> int
-    {
-        auto* tcache = reinterpret_cast<Module_Julia::Task_jl_cache*>(reinterpret_cast<char*>(&m) + tcache_offset);
-        return Module_Julia::slow_exec_codelet(tcache, frame_id);
-    };
+    this->self_module->create_codelet(
+      task,
+      [tcache_offset](module::Module& m, runtime::Task& /*t*/, const size_t frame_id) -> int
+      {
+          auto* tcache = reinterpret_cast<Module_Julia::Task_jl_cache*>(reinterpret_cast<char*>(&m) + tcache_offset);
+          return Module_Julia::slow_exec_codelet(tcache, frame_id);
+      });
 }
 
-template<size_t N_SCKS, size_t I = N_SCKS>
-static inline typename std::enable_if<(I <= SPU_MAX_DIRECT_TRAMPOLINE_ARGS), Codelet_fn>::type
-make_fast_codelet_arity(const ptrdiff_t tcache_offset, const size_t expected_n_obj_args)
+template<size_t N_SCKS, size_t I>
+void
+Module_Julia::bind_fast_codelet_arity(runtime::Task& task,
+                                      const ptrdiff_t tcache_offset,
+                                      const size_t expected_n_obj_args,
+                                      std::true_type)
 {
     if (expected_n_obj_args == I)
     {
-        return [tcache_offset](module::Module& m, runtime::Task& /*t*/, const size_t frame_id) -> int
-        {
-            auto* tcache = reinterpret_cast<Module_Julia::Task_jl_cache*>(reinterpret_cast<char*>(&m) + tcache_offset);
-            return exec_codelet_fixed<N_SCKS, I>(tcache, m, frame_id);
-        };
+        this->self_module->create_codelet(
+          task,
+          [tcache_offset](module::Module& m, runtime::Task& /*t*/, const size_t frame_id) -> int
+          {
+              auto* tcache =
+                reinterpret_cast<Module_Julia::Task_jl_cache*>(reinterpret_cast<char*>(&m) + tcache_offset);
+              return exec_codelet_fixed<N_SCKS, I>(tcache, m, frame_id);
+          });
+        return;
     }
-    return make_fast_codelet_arity<N_SCKS, I + 1>(tcache_offset, expected_n_obj_args);
+    constexpr bool next_in_range = (I + 1 <= Module_Julia::SPU_MAX_DIRECT_TRAMPOLINE_ARGS);
+    this->bind_fast_codelet_arity<N_SCKS, I + 1>(
+      task, tcache_offset, expected_n_obj_args, std::integral_constant<bool, next_in_range>());
 }
 #endif
 
@@ -1003,31 +1019,31 @@ Module_Julia::_create_codelet(runtime::Task& task, const std::string& julia_func
         switch (n_scks)
         {
             case 0:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<0>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<0>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 1:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<1>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<1>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 2:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<2>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<2>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 3:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<3>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<3>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 4:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<4>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<4>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 5:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<5>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<5>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 6:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<6>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<6>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 7:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<7>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<7>(task, tcache_offset, expected_n_obj_args);
                 break;
             case 8:
-                this->self_module->create_codelet(task, make_fast_codelet_arity<8>(tcache_offset, expected_n_obj_args));
+                this->bind_fast_codelet_arity<8>(task, tcache_offset, expected_n_obj_args);
                 break;
             default:
                 break;

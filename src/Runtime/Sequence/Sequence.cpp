@@ -783,6 +783,163 @@ Sequence::deallocate_outbuffers()
     }
 }
 
+// Outlined post-execution socket-rebinding helper for Switcher (select/commute) and Adaptor_m_to_n (pull/push) in
+// `no_copy_mode`. By separating this rebind logic from task execution, every task in `Sequence::exec_subsequence*`
+// executes the inlined `task->exec()` directly without `std::function<const int*()>`.
+#if defined(_MSC_VER)
+#define SPU_SEQ_NOINLINE __declspec(noinline)
+#else
+#define SPU_SEQ_NOINLINE __attribute__((noinline))
+#endif
+
+SPU_SEQ_NOINLINE void
+Sequence::apply_custom_process_rebind(Sub_sequence* contents, Task* task, const Custom_process_info& info)
+{
+    const auto rebind_id = info.rebind_id;
+    switch (info.type)
+    {
+        case process_t::SWITCHER_SELECT:
+        {
+            auto* switcher = static_cast<module::Switcher*>(info.module_ptr);
+            const auto path = switcher->get_path();
+            const auto in_dataptr = task->sockets[path]->_get_dataptr();
+            for (size_t sout_id = 0; sout_id < contents->rebind_sockets[rebind_id].size(); sout_id++)
+                for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id][sout_id].size(); sin_id++)
+                    contents->rebind_sockets[rebind_id][sout_id][sin_id]->dataptr = in_dataptr;
+            break;
+        }
+        case process_t::SWITCHER_COMMUTE:
+        {
+            auto* switcher = static_cast<module::Switcher*>(info.module_ptr);
+            const auto in_dataptr = task->sockets[0]->_get_dataptr();
+            const auto path = switcher->get_path();
+            for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id][path].size(); sin_id++)
+                contents->rebind_sockets[rebind_id][path][sin_id]->dataptr = in_dataptr;
+            break;
+        }
+        case process_t::ADAPTOR_PULL:
+        {
+            auto* adp_pull = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
+            for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id].size(); sin_id++)
+            {
+                if (contents->rebind_sockets[rebind_id][sin_id].size() > 1)
+                {
+                    auto swap_buff = contents->rebind_sockets[rebind_id][sin_id][1]->_get_dataptr();
+                    auto buff = adp_pull->get_filled_buffer(sin_id, swap_buff);
+                    contents->rebind_sockets[rebind_id][sin_id][1]->dataptr = buff;
+                    for (size_t ta = 2; ta < contents->rebind_sockets[rebind_id][sin_id].size(); ta++)
+                        contents->rebind_sockets[rebind_id][sin_id][ta]->dataptr = buff;
+                }
+            }
+            adp_pull->wake_up_pusher();
+            break;
+        }
+        case process_t::ADAPTOR_PUSH:
+        {
+            auto* adp_push = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
+            for (size_t sout_id = 0; sout_id < contents->rebind_sockets[rebind_id].size(); sout_id++)
+            {
+                auto swap_buff = contents->rebind_sockets[rebind_id][sout_id][1]->_get_dataptr();
+                auto buff = adp_push->get_empty_buffer(sout_id, swap_buff);
+                contents->rebind_sockets[rebind_id][sout_id][1]->dataptr = buff;
+                for (size_t ta = 2; ta < contents->rebind_sockets[rebind_id][sout_id].size(); ta++)
+                    contents->rebind_sockets[rebind_id][sout_id][ta]->dataptr = buff;
+            }
+            adp_push->wake_up_puller();
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// Static recursive helpers replacing the per-_exec std::function<void(Digraph_node<Sub_sequence>*)> lambdas.
+// Calling a static function avoids std::function's indirect virtual call on every sub-sequence node, and invokes
+// the inlined `task->exec()` directly on `contents->tasks` (using `status_dataptr_ptr` instead of `sockets.back()`,
+// and `custom_processes` instead of `std::function<const int*()> processes` when `has_custom_processes` is true).
+inline void
+Sequence::exec_subsequence(tools::Digraph_node<Sub_sequence>* cur_ss, std::vector<const int*>& statuses)
+{
+    auto* contents = cur_ss->get_c();
+    const auto type = contents->type;
+    auto& tasks = contents->tasks;
+    auto& tasks_id = contents->tasks_id;
+
+    if (type == subseq_t::COMMUTE)
+    {
+        tasks[0]->exec();
+        const int* status = (const int*)(*tasks[0]->status_dataptr_ptr);
+        statuses[tasks_id[0]] = status;
+        if (contents->has_custom_processes)
+            Sequence::apply_custom_process_rebind(contents, tasks[0], contents->custom_processes[0]);
+        const int path = status[0];
+        if (cur_ss->get_children().size() > (size_t)path)
+            Sequence::exec_subsequence(cur_ss->get_children()[path], statuses);
+    }
+    else
+    {
+        if (!contents->has_custom_processes)
+        {
+            for (size_t p = 0; p < tasks.size(); p++)
+            {
+                tasks[p]->exec();
+                statuses[tasks_id[p]] = (const int*)(*tasks[p]->status_dataptr_ptr);
+            }
+        }
+        else
+        {
+            const auto& custom = contents->custom_processes;
+            for (size_t p = 0; p < tasks.size(); p++)
+            {
+                tasks[p]->exec();
+                if (SPU_TASK_UNLIKELY(custom[p].type != process_t::STD))
+                    Sequence::apply_custom_process_rebind(contents, tasks[p], custom[p]);
+                statuses[tasks_id[p]] = (const int*)(*tasks[p]->status_dataptr_ptr);
+            }
+        }
+        for (auto* c : cur_ss->get_children())
+            Sequence::exec_subsequence(c, statuses);
+    }
+}
+
+inline void
+Sequence::exec_subsequence_without_statuses(tools::Digraph_node<Sub_sequence>* cur_ss)
+{
+    auto* contents = cur_ss->get_c();
+    const auto type = contents->type;
+    auto& tasks = contents->tasks;
+
+    if (type == subseq_t::COMMUTE)
+    {
+        tasks[0]->exec();
+        if (contents->has_custom_processes)
+            Sequence::apply_custom_process_rebind(contents, tasks[0], contents->custom_processes[0]);
+        const int path = ((const int*)(*tasks[0]->status_dataptr_ptr))[0];
+        if (cur_ss->get_children().size() > (size_t)path)
+            Sequence::exec_subsequence_without_statuses(cur_ss->get_children()[path]);
+    }
+    else
+    {
+        if (!contents->has_custom_processes)
+        {
+            for (auto* task : tasks)
+                task->exec();
+        }
+        else
+        {
+            const auto& custom = contents->custom_processes;
+            for (size_t p = 0; p < tasks.size(); p++)
+            {
+                tasks[p]->exec();
+                if (SPU_TASK_UNLIKELY(custom[p].type != process_t::STD))
+                    Sequence::apply_custom_process_rebind(contents, tasks[p], custom[p]);
+            }
+        }
+        for (auto* c : cur_ss->get_children())
+            Sequence::exec_subsequence_without_statuses(c);
+    }
+}
+
 void
 Sequence::_exec(const size_t tid,
                 std::function<bool(const std::vector<const int*>&)>& stop_condition,
@@ -798,28 +955,6 @@ Sequence::_exec(const size_t tid,
             tools::Thread_pinning::pin(this->pin_objects_per_thread[tid]);
     }
 
-    std::function<void(tools::Digraph_node<Sub_sequence>*, std::vector<const int*>&)> exec_sequence =
-      [&exec_sequence](tools::Digraph_node<Sub_sequence>* cur_ss, std::vector<const int*>& statuses)
-    {
-        auto type = cur_ss->get_c()->type;
-        auto& tasks_id = cur_ss->get_c()->tasks_id;
-        auto& processes = cur_ss->get_c()->processes;
-
-        if (type == subseq_t::COMMUTE)
-        {
-            statuses[tasks_id[0]] = processes[0]();
-            const int path = statuses[tasks_id[0]][0];
-            if (cur_ss->get_children().size() > (size_t)path) exec_sequence(cur_ss->get_children()[path], statuses);
-        }
-        else
-        {
-            for (size_t p = 0; p < processes.size(); p++)
-                statuses[tasks_id[p]] = processes[p]();
-            for (auto c : cur_ss->get_children())
-                exec_sequence(c, statuses);
-        }
-    };
-
     std::vector<const int*> statuses(this->n_tasks, nullptr);
 #ifdef SPU_JULIA
     // If this sequence (or pipeline stage) contains only pure C++ tasks (!this->has_julia()) but is executed by a
@@ -833,22 +968,25 @@ Sequence::_exec(const size_t tid,
 #endif
     try
     {
+        auto& swi_reset = this->switchers_reset[tid];
+        std::atomic<bool>* exit_loop_ptr = this->force_exit_loop.get();
         do
         {
             // force switchers reset to reinitialize the path to the last input socket
-            for (size_t s = 0; s < this->switchers_reset[tid].size(); s++)
-                this->switchers_reset[tid][s]->reset();
+            for (size_t s = 0; s < swi_reset.size(); s++)
+                swi_reset[s]->reset();
 
             std::fill(statuses.begin(), statuses.end(), nullptr);
             try
             {
-                exec_sequence(sequence, statuses);
+                exec_subsequence(sequence, statuses);
             }
             catch (tools::processing_aborted const&)
             {
                 // do nothing, this is normal
             }
-        } while (!*force_exit_loop && !stop_condition(statuses) && !tools::Signal_handler::is_sigint());
+        } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition(statuses) &&
+                 !tools::Signal_handler::is_sigint());
 
         if (tools::Signal_handler::is_sigint())
             for (auto& m : this->get_modules<tools::Interface_waiting>())
@@ -902,26 +1040,6 @@ Sequence::_exec_without_statuses(const size_t tid,
             tools::Thread_pinning::pin(this->pin_objects_per_thread[tid]);
     }
 
-    std::function<void(tools::Digraph_node<Sub_sequence>*)> exec_sequence =
-      [&exec_sequence](tools::Digraph_node<Sub_sequence>* cur_ss)
-    {
-        auto type = cur_ss->get_c()->type;
-        auto& processes = cur_ss->get_c()->processes;
-
-        if (type == subseq_t::COMMUTE)
-        {
-            const int path = processes[0]()[0];
-            if (cur_ss->get_children().size() > (size_t)path) exec_sequence(cur_ss->get_children()[path]);
-        }
-        else
-        {
-            for (auto& process : processes)
-                process();
-            for (auto c : cur_ss->get_children())
-                exec_sequence(c);
-        }
-    };
-
 #ifdef SPU_JULIA
     // If this sequence (or pipeline stage) contains only pure C++ tasks (!this->has_julia()) but is executed by a
     // thread registered with the Julia runtime (e.g., the main thread or a Thread_pool_Julia stage runner, where
@@ -934,21 +1052,24 @@ Sequence::_exec_without_statuses(const size_t tid,
 #endif
     try
     {
+        auto& swi_reset = this->switchers_reset[tid];
+        std::atomic<bool>* exit_loop_ptr = this->force_exit_loop.get();
         do
         {
             // force switchers reset to reinitialize the path to the last input socket
-            for (size_t s = 0; s < this->switchers_reset[tid].size(); s++)
-                this->switchers_reset[tid][s]->reset();
+            for (size_t s = 0; s < swi_reset.size(); s++)
+                swi_reset[s]->reset();
 
             try
             {
-                exec_sequence(sequence);
+                exec_subsequence_without_statuses(sequence);
             }
             catch (tools::processing_aborted const&)
             {
                 // do nothing, this is normal
             }
-        } while (!*force_exit_loop && !stop_condition() && !tools::Signal_handler::is_sigint());
+        } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition() &&
+                 !tools::Signal_handler::is_sigint());
 
         if (tools::Signal_handler::is_sigint())
             for (auto& m : this->get_modules<tools::Interface_waiting>())
@@ -992,9 +1113,13 @@ Sequence::exec(std::function<bool(const std::vector<const int*>&)> stop_conditio
 {
     if (this->is_no_copy_mode()) this->gen_processes(true);
 
+    // Only wrap stop_condition with this->is_done() when the sequence actually contains modules implementing
+    // Interface_is_done (!this->donners.empty()); otherwise this->is_done() always returns false and wrapping
+    // stop_condition would add an extra std::function virtual call + virtual is_done() call on every iteration.
+    // Capturing stop_condition by reference (&stop_condition) also keeps the lambda within std::function's SBO buffer.
     std::function<bool(const std::vector<const int*>&)> real_stop_condition;
-    if (this->auto_stop)
-        real_stop_condition = [this, stop_condition](const std::vector<const int*>& statuses)
+    if (this->auto_stop && !this->donners.empty())
+        real_stop_condition = [this, &stop_condition](const std::vector<const int*>& statuses)
         {
             bool res = stop_condition(statuses);
             return res || this->is_done();
@@ -1030,8 +1155,8 @@ Sequence::exec(std::function<bool()> stop_condition)
     if (this->is_no_copy_mode()) this->gen_processes(true);
 
     std::function<bool()> real_stop_condition;
-    if (this->auto_stop)
-        real_stop_condition = [this, stop_condition]()
+    if (this->auto_stop && !this->donners.empty())
+        real_stop_condition = [this, &stop_condition]()
         {
             bool res = stop_condition();
             return res || this->is_done();
@@ -2071,8 +2196,10 @@ Sequence::gen_processes(const bool no_copy_mode)
             already_parsed_nodes.push_back(cur_node);
 
             std::map<runtime::Task*, std::function<const int*()>> modified_tasks;
+            std::map<runtime::Task*, Custom_process_info> modified_custom_info;
             auto contents = cur_node->get_c();
             contents->processes.clear();
+            contents->custom_processes.clear();
             contents->rebind_sockets.clear();
             contents->rebind_dataptrs.clear();
             for (auto task : contents->tasks)
@@ -2109,10 +2236,11 @@ Sequence::gen_processes(const bool no_copy_mode)
                         }
                     }
 
+                    modified_custom_info[select_task] = { process_t::SWITCHER_SELECT, (uint32_t)rebind_id, switcher };
                     modified_tasks[select_task] = [contents, select_task, switcher, rebind_id]() -> const int*
                     {
                         select_task->exec();
-                        const int* status = select_task->sockets.back()->get_dataptr<int>();
+                        const int* status = (const int*)select_task->sockets.back()->_get_dataptr();
 
                         const auto path = switcher->get_path();
                         const auto in_dataptr = select_task->sockets[path]->_get_dataptr();
@@ -2159,10 +2287,11 @@ Sequence::gen_processes(const bool no_copy_mode)
                         }
                     }
 
+                    modified_custom_info[commute_task] = { process_t::SWITCHER_COMMUTE, (uint32_t)rebind_id, switcher };
                     modified_tasks[commute_task] = [contents, commute_task, switcher, rebind_id]() -> const int*
                     {
                         commute_task->exec();
-                        const int* status = commute_task->sockets.back()->get_dataptr<int>();
+                        const int* status = (const int*)commute_task->sockets.back()->_get_dataptr();
                         const auto in_dataptr = commute_task->sockets[0]->_get_dataptr();
                         const auto path = switcher->get_path();
 
@@ -2205,11 +2334,12 @@ Sequence::gen_processes(const bool no_copy_mode)
                         }
                     }
 
+                    modified_custom_info[pull_task] = { process_t::ADAPTOR_PULL, (uint32_t)rebind_id, adp_pull };
                     modified_tasks[pull_task] = [contents, pull_task, adp_pull, rebind_id]() -> const int*
                     {
                         // active or passive waiting here
                         pull_task->exec();
-                        const int* status = pull_task->sockets.back()->get_dataptr<int>();
+                        const int* status = (const int*)pull_task->sockets.back()->_get_dataptr();
 
                         // rebind input sockets on the fly
                         for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id].size(); sin_id++)
@@ -2266,11 +2396,12 @@ Sequence::gen_processes(const bool no_copy_mode)
                             contents->rebind_dataptrs[rebind_id].push_back(dataptrs);
                         }
 
+                    modified_custom_info[push_task] = { process_t::ADAPTOR_PUSH, (uint32_t)rebind_id, adp_push };
                     modified_tasks[push_task] = [contents, push_task, adp_push, rebind_id]() -> const int*
                     {
                         // active or passive waiting here
                         push_task->exec();
-                        const int* status = push_task->sockets.back()->get_dataptr<int>();
+                        const int* status = (const int*)push_task->sockets.back()->_get_dataptr();
                         // rebind output sockets on the fly
                         for (size_t sout_id = 0; sout_id < contents->rebind_sockets[rebind_id].size(); sout_id++)
                         {
@@ -2290,17 +2421,24 @@ Sequence::gen_processes(const bool no_copy_mode)
                 }
             }
 
+            contents->has_custom_processes = !modified_tasks.empty();
             for (auto task : contents->tasks)
                 if (modified_tasks.count(task))
+                {
+                    contents->custom_processes.push_back(modified_custom_info[task]);
                     contents->processes.push_back(modified_tasks[task]);
+                }
                 else
+                {
+                    contents->custom_processes.push_back({ process_t::STD, 0, nullptr });
                     contents->processes.push_back(
                       [task]() -> const int*
                       {
                           task->exec();
-                          const int* status = task->sockets.back()->get_dataptr<int>();
+                          const int* status = (const int*)task->sockets.back()->_get_dataptr();
                           return status;
                       });
+                }
 
             for (auto c : cur_node->get_children())
                 gen_processes_recursive(c, already_parsed_nodes);

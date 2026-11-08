@@ -46,6 +46,26 @@ enum class subseq_t : size_t
     SELECT
 };
 
+// Identifies the post-execution zero-copy socket-rebinding action associated with a task in `no_copy_mode`.
+// Storing a lightweight flat descriptor per task in `Sub_sequence_generic::custom_processes` eliminates
+// `std::function<const int*()>` indirect calls in `Sequence::exec_subsequence*` even when a sub-sequence contains
+// `Switcher` or `Adaptor_m_to_n` tasks (such as inside `Pipeline` stages or `no_copy_mode` control-flow loops).
+enum class process_t : uint8_t
+{
+    STD = 0,
+    SWITCHER_SELECT = 1,
+    SWITCHER_COMMUTE = 2,
+    ADAPTOR_PULL = 3,
+    ADAPTOR_PUSH = 4
+};
+
+struct Custom_process_info
+{
+    process_t type;
+    uint32_t rebind_id;
+    void* module_ptr;
+};
+
 template<class VTA = std::vector<runtime::Task*>>
 class Sub_sequence_generic
 {
@@ -60,10 +80,17 @@ class Sub_sequence_generic
     // the end of the chain execution
     std::vector<std::vector<std::vector<Socket*>>> rebind_sockets;
     std::vector<std::vector<std::vector<void*>>> rebind_dataptrs;
+    // Per-task flat descriptors for zero-copy socket rebinding when `has_custom_processes == true`.
+    std::vector<Custom_process_info> custom_processes;
+    // True only when no_copy_mode injects custom socket-rebinding hooks (for Switcher or Adaptor_m_to_n).
+    // When false (the vast majority of sub-sequences), Sequence::exec_subsequence* executes a tight loop of
+    // inlined `task->exec()` calls without checking `custom_processes`.
+    bool has_custom_processes;
 
     explicit Sub_sequence_generic()
       : type(subseq_t::STD)
       , id(0)
+      , has_custom_processes(false)
     {
     }
     virtual ~Sub_sequence_generic() = default;
@@ -364,6 +391,9 @@ class Sequence
                               const std::vector<std::pair<runtime::Task*, runtime::Socket*>>& unbind_tasks);
 
   private:
+    static void apply_custom_process_rebind(Sub_sequence* contents, Task* task, const Custom_process_info& info);
+    static inline void exec_subsequence(tools::Digraph_node<Sub_sequence>* cur_ss, std::vector<const int*>& statuses);
+    static inline void exec_subsequence_without_statuses(tools::Digraph_node<Sub_sequence>* cur_ss);
     template<class SS, class TA>
     void init(const std::vector<TA*>& firsts, const std::vector<TA*>& lasts, const std::vector<TA*>& exclusions);
     template<class SS>

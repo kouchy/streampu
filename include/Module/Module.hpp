@@ -268,6 +268,20 @@ class Module
     void create_cdl(runtime::Task& task,
                     std::function<int(Module& m, runtime::Task& t, const size_t frame_id)> codelet);
 
+    // Template overloads forwarding raw codelet lambdas directly to Task::create_codelet(F&&) before std::function
+    // type erasure occurs, allowing Task to bind its direct C function pointer trampoline (fast_codelet_fn).
+    template<typename F,
+             typename std::enable_if<!std::is_same<typename std::decay<F>::type,
+                                                   std::function<int(Module&, runtime::Task&, const size_t)>>::value,
+                                     int>::type = 0>
+    inline void create_codelet(runtime::Task& task, F&& codelet);
+
+    template<typename F,
+             typename std::enable_if<!std::is_same<typename std::decay<F>::type,
+                                                   std::function<int(Module&, runtime::Task&, const size_t)>>::value,
+                                     int>::type = 0>
+    inline void create_cdl(runtime::Task& task, F&& codelet);
+
     void register_timer(runtime::Task& task, const std::string& key);
 
     virtual void set_n_frames_per_wave(const size_t n_frames_per_wave);

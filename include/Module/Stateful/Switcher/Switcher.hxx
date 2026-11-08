@@ -81,9 +81,14 @@ Switcher::Switcher(const size_t n_data_sockets,
         p1s_out_data.push_back(
           this->create_socket_out(p1, "out_data" + std::to_string(s), n_elmts_commute, datatype_commute));
 
+    // Capture the base socket index `p1s_out_data0` by value instead of `std::vector<size_t> p1s_out_data`:
+    // because the output sockets are created contiguously (`p1s_out_data[path] == p1s_out_data0 + path`), capturing
+    // three `size_t` scalars makes this lambda `std::is_trivially_copyable` (24 bytes) so `Task` dispatches it
+    // directly through `Task::call_fast_codelet` without `std::function` or vector heap indirection.
+    const size_t p1s_out_data0 = p1s_out_data[0];
     this->create_codelet(
       p1,
-      [p1s_in_data, p1s_in_ctrl, p1s_out_data](Module& m, runtime::Task& t, const size_t /*frame_id*/) -> int
+      [p1s_in_data, p1s_in_ctrl, p1s_out_data0](Module& m, runtime::Task& t, const size_t /*frame_id*/) -> int
       {
           auto& swi = static_cast<Switcher&>(m);
 
@@ -94,10 +99,11 @@ Switcher::Switcher(const size_t n_data_sockets,
           if (!swi.is_no_copy_commute())
           {
               const auto data_socket_in = t[p1s_in_data].get_dataptr<const int8_t>();
-              auto data_socket_out = t[p1s_out_data[path]].get_dataptr<int8_t>();
+              auto data_socket_out = t[p1s_out_data0 + path].get_dataptr<int8_t>();
 
-              std::copy(
-                data_socket_in, data_socket_in + swi.get_n_frames() * swi.get_n_bytes_commute(), data_socket_out);
+              std::copy(data_socket_in,
+                        data_socket_in + swi.Module::get_n_frames() * swi.get_n_bytes_commute(),
+                        data_socket_out);
           }
 
           return (int)path;
@@ -110,8 +116,11 @@ Switcher::Switcher(const size_t n_data_sockets,
           this->create_socket_in(p2, "in_data" + std::to_string(s), n_elmts_select, datatype_select));
     auto p2s_out_data = this->create_socket_out(p2, "out_data", n_elmts_select, datatype_select);
 
+    // Same scalar-capture optimization as `commute`: `p2s_in_data[path] == p2s_in_data0 + path`, keeping the lambda
+    // trivially copyable (16 bytes) for direct `Task::call_fast_codelet` dispatch.
+    const size_t p2s_in_data0 = p2s_in_data[0];
     this->create_codelet(p2,
-                         [p2s_in_data, p2s_out_data](Module& m, runtime::Task& t, const size_t /*frame_id*/) -> int
+                         [p2s_in_data0, p2s_out_data](Module& m, runtime::Task& t, const size_t /*frame_id*/) -> int
                          {
                              auto& swi = static_cast<Switcher&>(m);
 
@@ -119,11 +128,11 @@ Switcher::Switcher(const size_t n_data_sockets,
                              {
                                  const size_t path = swi.get_path();
 
-                                 const auto data_socket_in = t[p2s_in_data[path]].get_dataptr<const int8_t>();
+                                 const auto data_socket_in = t[p2s_in_data0 + path].get_dataptr<const int8_t>();
                                  auto data_socket_out = t[p2s_out_data].get_dataptr<int8_t>();
 
                                  std::copy(data_socket_in,
-                                           data_socket_in + swi.get_n_frames() * swi.get_n_bytes_select(),
+                                           data_socket_in + swi.Module::get_n_frames() * swi.get_n_bytes_select(),
                                            data_socket_out);
                              }
 

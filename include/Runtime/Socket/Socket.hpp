@@ -201,6 +201,10 @@ class Socket : public tools::Interface_reset
 
   private:
     inline void check_bound_socket();
+    // Outlined cold error helper for non-const SIN socket access in get_dataptr<T>().
+    // Marked [[noreturn]] so callers know this branch never returns and do not spill registers in their prologue.
+    template<typename T>
+    [[noreturn]] void throw_non_const_sin_error() const;
 };
 }
 }

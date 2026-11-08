@@ -234,21 +234,40 @@ Socket::get_2d_dptr(const size_t start_row, const size_t start_col)
     return this->_get_2d_dptr(start_row, start_col);
 }
 
+#if defined(_MSC_VER)
+#define SPU_SOCKET_NOINLINE __declspec(noinline)
+#define SPU_SOCKET_UNLIKELY(x) (x)
+#else
+#define SPU_SOCKET_NOINLINE __attribute__((noinline))
+#define SPU_SOCKET_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
+
+// Outlined cold error path for get_dataptr<T>() when T is non-const on an input socket (socket_t::SIN).
+// Keeping std::stringstream construction and exception throwing out of get_dataptr<T>() (with SPU_SOCKET_NOINLINE
+// and [[noreturn]]) prevents a ~600-byte stack frame and callee-saved register spills in every codelet lambda
+// that calls get_dataptr<T>() on a mutable or forward (SFWD) socket.
+template<typename T>
+[[noreturn]] SPU_SOCKET_NOINLINE void
+Socket::throw_non_const_sin_error() const
+{
+    std::stringstream message;
+    message << "'This is an input socket and the 'T' template should be 'const' ("
+            << "'T' = " << typeid(T).name() << ", "
+            << "'datatype' = " << type_to_string[this->datatype] << ", "
+            << "'name' = " << get_name() << ", "
+            << "'task.name' = " << task.get_name() << ").";
+    throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
+}
+
 template<typename T>
 T*
 Socket::get_dataptr(const size_t start_col) const
 {
 #ifndef SPU_FAST
-    if (this->get_type() == socket_t::SIN && !std::is_const<T>::value)
-    {
-        std::stringstream message;
-        message << "'This is an input socket and the 'T' template should be 'const' ("
-                << "'T' = " << typeid(T).name() << ", "
-                << "'datatype' = " << type_to_string[this->datatype] << ", "
-                << "'name' = " << get_name() << ", "
-                << "'task.name' = " << task.get_name() << ").";
-        throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
-    }
+    // Evaluated at compile time first (!std::is_const<T>::value): for get_dataptr<const T>(), the entire check is
+    // dead-code eliminated by the compiler; for mutable T, only a single byte load + branch remains on the hot path.
+    if (!std::is_const<T>::value && SPU_SOCKET_UNLIKELY(this->get_type() == socket_t::SIN))
+        this->template throw_non_const_sin_error<T>();
 #endif
 
     return static_cast<T*>(this->_get_dataptr(start_col * sizeof(T)));
@@ -266,16 +285,8 @@ T**
 Socket::get_2d_dataptr(const size_t start_row, const size_t start_col)
 {
 #ifndef SPU_FAST
-    if (this->get_type() == socket_t::SIN && !std::is_const<T>::value)
-    {
-        std::stringstream message;
-        message << "'This is an input socket and the 'T' template should be 'const' ("
-                << "'T' = " << typeid(T).name() << ", "
-                << "'datatype' = " << type_to_string[this->datatype] << ", "
-                << "'name' = " << get_name() << ", "
-                << "'task.name' = " << task.get_name() << ").";
-        throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
-    }
+    if (!std::is_const<T>::value && SPU_SOCKET_UNLIKELY(this->get_type() == socket_t::SIN))
+        this->template throw_non_const_sin_error<T>();
 #endif
 
     return (T**)(this->_get_2d_dataptr(start_row, start_col * sizeof(T)));

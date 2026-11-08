@@ -16,6 +16,22 @@
 using namespace spu;
 using namespace spu::runtime;
 
+// Fallback trampoline when a codelet was registered directly as a std::function or exceeds fast_codelet_capacity.
+int
+Task::call_std_function_codelet(const void* /*data*/, module::Module& m, Task& t, size_t frame_id)
+{
+    return t.codelet(m, t, frame_id);
+}
+
+// Recompute the combined single-wave and fast-execution flags so Task::exec() and Task::_exec() can test a single
+// boolean on the hot path instead of loading and comparing multiple fields across Task and Module.
+inline void
+Task::update_fast_exec_flags()
+{
+    this->is_single_wave_exec = (this->module->Module::get_n_frames() == this->module->Module::get_n_frames_per_wave());
+    this->is_fast_exec = this->fast && !this->stats && !this->debug && this->is_single_wave_exec;
+}
+
 Task::Task(module::Module& module,
            const std::string& name,
            const bool stats,
@@ -30,6 +46,8 @@ Task::Task(module::Module& module,
   , outbuffers_allocated(outbuffers_allocated)
   , debug_hex(false)
   , replicable(module.is_clonable())
+  , is_single_wave_exec(module.get_n_frames() == module.get_n_frames_per_wave())
+  , is_fast_exec(fast && !stats && !debug && is_single_wave_exec)
   , debug_limit(-1)
   , debug_precision(2)
   , debug_frame_max(-1)
@@ -39,6 +57,9 @@ Task::Task(module::Module& module,
           throw tools::unimplemented_error(__FILE__, __LINE__, __func__);
           return 0;
       })
+  , fast_codelet_fn(&Task::call_std_function_codelet)
+  , status_socket(nullptr)
+  , status_dataptr_ptr(nullptr)
   , n_input_sockets(0)
   , n_output_sockets(0)
   , n_fwd_sockets(0)
@@ -75,12 +96,14 @@ void
 Task::set_stats(const bool stats)
 {
     this->stats = stats;
+    this->update_fast_exec_flags();
 }
 
 void
 Task::set_fast(const bool fast)
 {
     this->fast = fast;
+    this->update_fast_exec_flags();
     for (size_t i = 0; i < sockets.size(); i++)
         sockets[i]->set_fast(this->fast);
 }
@@ -89,6 +112,7 @@ void
 Task::set_debug(const bool debug)
 {
     this->debug = debug;
+    this->update_fast_exec_flags();
 }
 
 void
@@ -236,40 +260,51 @@ display_data(const T* data,
     std::cout.flags(f);
 }
 
-void
-Task::_exec(const int frame_id, const bool managed_memory)
-{
-    const auto n_frames = this->get_module().get_n_frames();
-    const auto n_frames_per_wave = this->get_module().get_n_frames_per_wave();
-    const auto n_waves = this->get_module().get_n_waves();
-    const auto n_frames_per_wave_rest = this->get_module().get_n_frames_per_wave_rest();
+#if defined(_MSC_VER)
+#define SPU_TASK_NOINLINE __declspec(noinline)
+#else
+#define SPU_TASK_NOINLINE __attribute__((noinline))
+#endif
 
-    // do not use 'this->status' because the dataptr can have been changed by the 'tools::Sequence' when using the no
-    // copy mode
-    int* status = this->sockets.back()->get_dataptr<int>();
-    for (size_t w = 0; w < n_waves; w++)
-        status[w] = (int)status_t::UNKNOWN;
+SPU_TASK_NOINLINE void
+Task::_exec_slow(const int frame_id, const bool managed_memory)
+{
+    // Use non-virtual Module::* getters to avoid virtual dispatch through Interface_get_set_n_frames.
+    const auto n_frames = this->module->Module::get_n_frames();
+    const auto n_frames_per_wave = this->module->Module::get_n_frames_per_wave();
+    const auto n_waves = this->module->Module::get_n_waves();
+    const auto n_frames_per_wave_rest = this->module->Module::get_n_frames_per_wave_rest();
+    const size_t n_scks = this->sockets.size() - 1;
+
+    // Do not use 'this->status' directly because the status socket's dataptr may have been rebound by Sequence.
+    int* status = (int*)(*this->status_dataptr_ptr);
 
     if ((managed_memory == false && frame_id >= 0) || (frame_id == -1 && n_frames_per_wave == n_frames) ||
         (frame_id == 0 && n_frames_per_wave == 1) || (frame_id == 0 && n_waves > 1) ||
         (frame_id == 0 && n_frames_per_wave_rest == 0))
     {
+        for (size_t w = 0; w < n_waves; w++)
+            status[w] = (int)status_t::UNKNOWN;
         const auto real_frame_id = frame_id == -1 ? 0 : frame_id;
-        const size_t w = (real_frame_id % n_frames) / n_frames_per_wave;
-        status[w] = this->codelet(*this->module, *this, real_frame_id);
+        const size_t w =
+          (real_frame_id == 0 || n_waves == 1) ? 0 : ((size_t)real_frame_id % n_frames) / n_frames_per_wave;
+        status[w] = this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, real_frame_id);
     }
     else
     {
-        // save the initial dataptr of the sockets
-        for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
-            sockets_dataptr_init[sid] = (int8_t*)this->sockets[sid]->_get_dataptr();
+        // Save the initial dataptr of each data socket so it can be restored after the multi-wave loop.
+        for (size_t sid = 0; sid < n_scks; sid++)
+            sockets_dataptr_init[sid] = (int8_t*)this->sockets[sid]->dataptr;
 
         if (frame_id > 0 && managed_memory == true && n_frames_per_wave > 1)
         {
+            for (size_t w_init = 0; w_init < n_waves; w_init++)
+                status[w_init] = (int)status_t::UNKNOWN;
+
             const size_t w = (frame_id % n_frames) / n_frames_per_wave;
             const size_t w_pos = frame_id % n_frames_per_wave;
 
-            for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
+            for (size_t sid = 0; sid < n_scks; sid++)
             {
                 if (sockets[sid]->get_type() == socket_t::SIN || sockets[sid]->get_type() == socket_t::SFWD)
                     std::copy(
@@ -279,16 +314,47 @@ Task::_exec(const int frame_id, const bool managed_memory)
                 this->sockets[sid]->dataptr = (void*)sockets_data[sid].data();
             }
 
-            status[w] = this->codelet(*this->module, *this, w * n_frames_per_wave);
+            status[w] = this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, w * n_frames_per_wave);
 
-            for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
+            for (size_t sid = 0; sid < n_scks; sid++)
                 if (sockets[sid]->get_type() == socket_t::SOUT || sockets[sid]->get_type() == socket_t::SFWD)
                     std::copy(sockets_data[sid].begin() + (w_pos + 0) * sockets_databytes_per_frame[sid],
                               sockets_data[sid].begin() + (w_pos + 1) * sockets_databytes_per_frame[sid],
                               sockets_dataptr_init[sid] + (frame_id % n_frames) * sockets_databytes_per_frame[sid]);
         }
-        else // if (frame_id <= 0 || n_frames_per_wave == 1)
+        else if (frame_id < 0 && n_frames_per_wave_rest == 0)
         {
+            // Fast path for the standard multi-wave case (frame_id == -1 and n_frames is a multiple of
+            // n_frames_per_wave):
+            // 1. Wave w = 0 runs immediately with the existing socket dataptrs (which already equal
+            //    sockets_dataptr_init[sid]);
+            // 2. Subsequent waves w = 1 .. n_waves - 1 increment each socket's dataptr by the wave byte stride
+            //    instead of recomputing `w * n_frames_per_wave * sockets_databytes_per_frame[sid]`;
+            // 3. `status` is only backfilled with `status_t::UNKNOWN` for unexecuted trailing waves if a wave
+            //    aborts early with `status_t::FAILURE_STOP`.
+            status[0] = this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, 0);
+            auto exec_status = (status_t)status[0];
+            size_t w = 1;
+            for (; w < n_waves && exec_status != status_t::FAILURE_STOP; w++)
+            {
+                for (size_t sid = 0; sid < n_scks; sid++)
+                    this->sockets[sid]->dataptr = (void*)((int8_t*)this->sockets[sid]->dataptr +
+                                                          n_frames_per_wave * sockets_databytes_per_frame[sid]);
+
+                status[w] = this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, w * n_frames_per_wave);
+                exec_status = (status_t)status[w];
+            }
+            if (SPU_TASK_UNLIKELY(w < n_waves))
+            {
+                for (; w < n_waves; w++)
+                    status[w] = (int)status_t::UNKNOWN;
+            }
+        }
+        else // if (frame_id >= 0 || n_frames_per_wave_rest != 0)
+        {
+            for (size_t w_init = 0; w_init < n_waves; w_init++)
+                status[w_init] = (int)status_t::UNKNOWN;
+
             const size_t w_start = (frame_id < 0) ? 0 : frame_id % n_waves;
             const size_t w_stop = (frame_id < 0) ? n_waves : w_start + 1;
 
@@ -296,11 +362,11 @@ Task::_exec(const int frame_id, const bool managed_memory)
             auto exec_status = status_t::SUCCESS;
             for (w = w_start; w < w_stop - 1 && exec_status != status_t::FAILURE_STOP; w++)
             {
-                for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
+                for (size_t sid = 0; sid < n_scks; sid++)
                     this->sockets[sid]->dataptr =
                       (void*)(sockets_dataptr_init[sid] + w * n_frames_per_wave * sockets_databytes_per_frame[sid]);
 
-                status[w] = this->codelet(*this->module, *this, w * n_frames_per_wave);
+                status[w] = this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, w * n_frames_per_wave);
                 exec_status = (status_t)status[w];
             }
 
@@ -308,15 +374,16 @@ Task::_exec(const int frame_id, const bool managed_memory)
             {
                 if (n_frames_per_wave_rest == 0)
                 {
-                    for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
+                    for (size_t sid = 0; sid < n_scks; sid++)
                         this->sockets[sid]->dataptr =
                           (void*)(sockets_dataptr_init[sid] + w * n_frames_per_wave * sockets_databytes_per_frame[sid]);
 
-                    status[w] = this->codelet(*this->module, *this, w * n_frames_per_wave);
+                    status[w] =
+                      this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, w * n_frames_per_wave);
                 }
                 else
                 {
-                    for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
+                    for (size_t sid = 0; sid < n_scks; sid++)
                     {
                         if (sockets[sid]->get_type() == socket_t::SIN || sockets[sid]->get_type() == socket_t::SFWD)
                             std::copy(sockets_dataptr_init[sid] +
@@ -326,9 +393,10 @@ Task::_exec(const int frame_id, const bool managed_memory)
                         this->sockets[sid]->dataptr = (void*)sockets_data[sid].data();
                     }
 
-                    status[w] = this->codelet(*this->module, *this, w * n_frames_per_wave);
+                    status[w] =
+                      this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, w * n_frames_per_wave);
 
-                    for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
+                    for (size_t sid = 0; sid < n_scks; sid++)
                         if (sockets[sid]->get_type() == socket_t::SOUT || sockets[sid]->get_type() == socket_t::SFWD)
                             std::copy(
                               sockets_data[sid].begin(),
@@ -339,180 +407,374 @@ Task::_exec(const int frame_id, const bool managed_memory)
         }
 
         // restore the initial dataptr of the sockets
-        for (size_t sid = 0; sid < this->sockets.size() - 1; sid++)
+        for (size_t sid = 0; sid < n_scks; sid++)
             this->sockets[sid]->dataptr = (void*)sockets_dataptr_init[sid];
     }
 }
 
-const std::vector<int>&
-Task::exec(const int frame_id, const bool managed_memory)
+void
+Task::_exec(const int frame_id, const bool managed_memory)
 {
-#ifndef SPU_FAST
-    if (this->is_fast() && !this->is_debug() && !this->is_stats())
+    if (SPU_TASK_LIKELY(this->is_single_wave_exec && (frame_id == -1 || frame_id == 0)))
     {
-#endif
-        this->_exec(frame_id, managed_memory);
-        this->n_calls++;
-        return this->get_status();
-#ifndef SPU_FAST
+        // do not use 'this->status' because the dataptr can have been changed by the 'tools::Sequence' when using the
+        // no copy mode
+        const int exec_status = this->fast_codelet_fn(this->fast_codelet_data, *this->module, *this, 0);
+        *(int*)(*this->status_dataptr_ptr) = exec_status;
+        return;
     }
 
-    if (frame_id != -1 && (size_t)frame_id >= this->get_module().get_n_frames())
-    {
-        std::stringstream message;
-        message << "'frame_id' has to be equal to '-1' or to be smaller than 'n_frames' ('frame_id' = " << frame_id
-                << ", 'n_frames' = " << this->get_module().get_n_frames() << ").";
-        throw tools::length_error(__FILE__, __LINE__, __func__, message.str());
-    }
+    this->_exec_slow(frame_id, managed_memory);
+}
 
-    if (this->is_fast() || this->can_exec())
+SPU_TASK_NOINLINE size_t
+Task::_exec_debug_before()
+{
+    size_t max_n_chars = 0;
+    auto n_fra = this->module->get_n_frames();
+    auto n_fra_per_w = this->module->get_n_frames_per_wave();
+
+    std::string module_name = module->get_custom_name().empty() ? module->get_name() : module->get_custom_name();
+
+    std::cout << "# ";
+    std::cout << rang::style::bold << rang::fg::green << module_name << rang::style::reset << "::" << rang::style::bold
+              << rang::fg::magenta << get_name() << rang::style::reset << "(";
+    for (auto i = 0; i < (int)sockets.size() - 1; i++)
     {
-        size_t max_n_chars = 0;
-        if (this->is_debug())
+        auto& s = *sockets[i];
+        auto s_type = s.get_type();
+        auto n_elmts = s.get_databytes() / (size_t)s.get_datatype_size();
+        std::cout << rang::style::bold << rang::fg::blue << (s_type == socket_t::SIN ? "const " : "")
+                  << s.get_datatype_string() << rang::style::reset << " " << s.get_name() << "["
+                  << (n_fra > 1 ? std::to_string(n_fra) + "x" : "") << (n_elmts / n_fra) << "]"
+                  << (i < (int)sockets.size() - 2 ? ", " : "");
+
+        max_n_chars = std::max(s.get_name().size(), max_n_chars);
+    }
+    std::cout << ")" << std::endl;
+
+    for (auto& s : sockets)
+    {
+        auto s_type = s->get_type();
+        if (s_type == socket_t::SIN || s_type == socket_t::SFWD)
         {
-            auto n_fra = this->module->get_n_frames();
-            auto n_fra_per_w = this->module->get_n_frames_per_wave();
+            std::string spaces;
+            for (size_t ss = 0; ss < max_n_chars - s->get_name().size(); ss++)
+                spaces += " ";
 
-            std::string module_name =
-              module->get_custom_name().empty() ? module->get_name() : module->get_custom_name();
+            auto n_elmts = s->get_databytes() / (size_t)s->get_datatype_size();
+            auto fra_size = n_elmts / n_fra;
+            auto limit = debug_limit != -1 ? std::min(fra_size, (size_t)debug_limit) : fra_size;
+            auto max_frame = debug_frame_max != -1 ? std::min(n_fra, (size_t)debug_frame_max) : n_fra;
+            auto p = debug_precision;
+            auto h = debug_hex;
+            std::cout << "# {IN}  " << s->get_name() << spaces << " = [";
+            if (s->get_datatype() == typeid(int8_t))
+                display_data(s->get_dataptr<const int8_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint8_t))
+                display_data(s->get_dataptr<const uint8_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(int16_t))
+                display_data(s->get_dataptr<const int16_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint16_t))
+                display_data(s->get_dataptr<const uint16_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(int32_t))
+                display_data(s->get_dataptr<const int32_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint32_t))
+                display_data(s->get_dataptr<const uint32_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(int64_t))
+                display_data(s->get_dataptr<const int64_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint64_t))
+                display_data(s->get_dataptr<const uint64_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(float))
+                display_data(s->get_dataptr<const float>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(double))
+                display_data(s->get_dataptr<const double>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            std::cout << "]" << std::endl;
+        }
+    }
+    return max_n_chars;
+}
 
-            std::cout << "# ";
-            std::cout << rang::style::bold << rang::fg::green << module_name << rang::style::reset
-                      << "::" << rang::style::bold << rang::fg::magenta << get_name() << rang::style::reset << "(";
-            for (auto i = 0; i < (int)sockets.size() - 1; i++)
+SPU_TASK_NOINLINE void
+Task::_exec_debug_after(const size_t max_n_chars)
+{
+    auto n_fra = this->module->get_n_frames();
+    auto n_fra_per_w = this->module->get_n_frames_per_wave();
+    for (auto& s : sockets)
+    {
+        auto s_type = s->get_type();
+        if ((s_type == socket_t::SOUT) && s->get_name() != "status")
+        {
+            std::string spaces;
+            for (size_t ss = 0; ss < max_n_chars - s->get_name().size(); ss++)
+                spaces += " ";
+
+            auto n_elmts = s->get_databytes() / (size_t)s->get_datatype_size();
+            auto fra_size = n_elmts / n_fra;
+            auto limit = debug_limit != -1 ? std::min(fra_size, (size_t)debug_limit) : fra_size;
+            auto max_frame = debug_frame_max != -1 ? std::min(n_fra, (size_t)debug_frame_max) : n_fra;
+            auto p = debug_precision;
+            auto h = debug_hex;
+            std::cout << "# {OUT} " << s->get_name() << spaces << " = [";
+            if (s->get_datatype() == typeid(int8_t))
+                display_data(s->get_dataptr<const int8_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint8_t))
+                display_data(s->get_dataptr<const uint8_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(int16_t))
+                display_data(s->get_dataptr<const int16_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint16_t))
+                display_data(s->get_dataptr<const uint16_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(int32_t))
+                display_data(s->get_dataptr<const int32_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint32_t))
+                display_data(s->get_dataptr<const uint32_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(int64_t))
+                display_data(s->get_dataptr<const int64_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(uint64_t))
+                display_data(s->get_dataptr<const uint64_t>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(float))
+                display_data(s->get_dataptr<const float>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            else if (s->get_datatype() == typeid(double))
+                display_data(s->get_dataptr<const double>(),
+                             fra_size,
+                             n_fra,
+                             n_fra_per_w,
+                             limit,
+                             max_frame,
+                             p,
+                             (uint8_t)max_n_chars + 12,
+                             h);
+            std::cout << "]" << std::endl;
+        }
+    }
+    std::cout << "# Returned status: [";
+    // do not use 'this->status' because the dataptr can have been changed by the 'tools::Sequence' when using
+    // the no copy mode
+    int* status = (int*)this->sockets.back()->_get_dataptr();
+    for (size_t w = 0; w < this->module->get_n_waves(); w++)
+    {
+        if (status_t_to_string.count(status[w]))
+            std::cout << ((w != 0) ? ", " : "") << std::dec << status[w] << " '" << status_t_to_string[status[w]]
+                      << "'";
+        else
+            std::cout << ((w != 0) ? ", " : "") << std::dec << status[w];
+    }
+    std::cout << "]" << std::endl;
+    std::cout << "#" << std::noshowbase << std::endl;
+}
+
+[[noreturn]] SPU_TASK_NOINLINE void
+Task::throw_invalid_frame_id(const int frame_id) const
+{
+    std::stringstream message;
+    message << "'frame_id' has to be equal to '-1' or to be smaller than 'n_frames' ('frame_id' = " << frame_id
+            << ", 'n_frames' = " << this->get_module().get_n_frames() << ").";
+    throw tools::length_error(__FILE__, __LINE__, __func__, message.str());
+}
+
+[[noreturn]] SPU_TASK_NOINLINE void
+Task::throw_cannot_exec() const
+{
+    std::stringstream input_socs;
+    std::stringstream output_socs;
+    input_socs << "'socket(s).name' = [";
+    output_socs << "'socket(s).name' = [";
+    auto s = 0;
+    for (size_t i = 0; i < sockets.size(); i++)
+    {
+        if (sockets[i]->dataptr == nullptr)
+        {
+            if (sockets[i]->get_type() == runtime::socket_t::SOUT)
             {
-                auto& s = *sockets[i];
-                auto s_type = s.get_type();
-                auto n_elmts = s.get_databytes() / (size_t)s.get_datatype_size();
-                std::cout << rang::style::bold << rang::fg::blue << (s_type == socket_t::SIN ? "const " : "")
-                          << s.get_datatype_string() << rang::style::reset << " " << s.get_name() << "["
-                          << (n_fra > 1 ? std::to_string(n_fra) + "x" : "") << (n_elmts / n_fra) << "]"
-                          << (i < (int)sockets.size() - 2 ? ", " : "");
-
-                max_n_chars = std::max(s.get_name().size(), max_n_chars);
+                output_socs << (s != 0 ? ", " : "") << sockets[i]->name;
             }
-            std::cout << ")" << std::endl;
-
-            for (auto& s : sockets)
+            else
             {
-                auto s_type = s->get_type();
-                if (s_type == socket_t::SIN || s_type == socket_t::SFWD)
-                {
-                    std::string spaces;
-                    for (size_t ss = 0; ss < max_n_chars - s->get_name().size(); ss++)
-                        spaces += " ";
-
-                    auto n_elmts = s->get_databytes() / (size_t)s->get_datatype_size();
-                    auto fra_size = n_elmts / n_fra;
-                    auto limit = debug_limit != -1 ? std::min(fra_size, (size_t)debug_limit) : fra_size;
-                    auto max_frame = debug_frame_max != -1 ? std::min(n_fra, (size_t)debug_frame_max) : n_fra;
-                    auto p = debug_precision;
-                    auto h = debug_hex;
-                    std::cout << "# {IN}  " << s->get_name() << spaces << " = [";
-                    if (s->get_datatype() == typeid(int8_t))
-                        display_data(s->get_dataptr<const int8_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint8_t))
-                        display_data(s->get_dataptr<const uint8_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(int16_t))
-                        display_data(s->get_dataptr<const int16_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint16_t))
-                        display_data(s->get_dataptr<const uint16_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(int32_t))
-                        display_data(s->get_dataptr<const int32_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint32_t))
-                        display_data(s->get_dataptr<const uint32_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(int64_t))
-                        display_data(s->get_dataptr<const int64_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint64_t))
-                        display_data(s->get_dataptr<const uint64_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(float))
-                        display_data(s->get_dataptr<const float>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(double))
-                        display_data(s->get_dataptr<const double>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    std::cout << "]" << std::endl;
-                }
+                input_socs << (s != 0 ? ", " : "") << sockets[i]->name;
             }
         }
+    }
+    std::stringstream message;
+    message << "The task ('task.name' = " << this->get_name() << ", 'module.name' = " << module->get_name()
+            << ", cannot be executed because : " << std::endl
+            << "The inputs/forward sockets : " << input_socs.str() << "] are not fed" << std::endl
+            << "The output sockets : " << output_socs.str() << "] are not allocated";
+    throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
+}
+
+#ifndef SPU_FAST
+// Outlined non-single-wave or non-fast execution path (when !is_single_wave_exec, !is_fast(), is_stats(), or
+// is_debug()). Isolating std::chrono::steady_clock::now(), can_exec(), and debug formatting in a SPU_TASK_NOINLINE
+// helper allows Task::exec() to be inlined directly in Task.hxx with minimal code size.
+SPU_TASK_NOINLINE const std::vector<int>&
+Task::_exec_general(const int frame_id, const bool managed_memory)
+{
+    if (SPU_TASK_LIKELY(this->fast && !this->stats && !this->debug))
+    {
+        this->_exec_slow(frame_id, managed_memory);
+        this->n_calls++;
+        return this->status;
+    }
+
+    if (SPU_TASK_UNLIKELY(frame_id != -1 && (size_t)frame_id >= this->module->Module::get_n_frames()))
+        this->throw_invalid_frame_id(frame_id);
+
+    if (SPU_TASK_LIKELY(this->is_fast() || this->can_exec()))
+    {
+        size_t max_n_chars = 0;
+        if (SPU_TASK_UNLIKELY(this->is_debug())) max_n_chars = this->_exec_debug_before();
 
         if (this->is_stats())
         {
@@ -538,184 +800,16 @@ Task::exec(const int frame_id, const bool managed_memory)
         }
         this->n_calls++;
 
-        if (this->is_debug())
-        {
-            auto n_fra = this->module->get_n_frames();
-            auto n_fra_per_w = this->module->get_n_frames_per_wave();
-            for (auto& s : sockets)
-            {
-                auto s_type = s->get_type();
-                if ((s_type == socket_t::SOUT) && s->get_name() != "status")
-                {
-                    std::string spaces;
-                    for (size_t ss = 0; ss < max_n_chars - s->get_name().size(); ss++)
-                        spaces += " ";
-
-                    auto n_elmts = s->get_databytes() / (size_t)s->get_datatype_size();
-                    auto fra_size = n_elmts / n_fra;
-                    auto limit = debug_limit != -1 ? std::min(fra_size, (size_t)debug_limit) : fra_size;
-                    auto max_frame = debug_frame_max != -1 ? std::min(n_fra, (size_t)debug_frame_max) : n_fra;
-                    auto p = debug_precision;
-                    auto h = debug_hex;
-                    std::cout << "# {OUT} " << s->get_name() << spaces << " = [";
-                    if (s->get_datatype() == typeid(int8_t))
-                        display_data(s->get_dataptr<const int8_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint8_t))
-                        display_data(s->get_dataptr<const uint8_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(int16_t))
-                        display_data(s->get_dataptr<const int16_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint16_t))
-                        display_data(s->get_dataptr<const uint16_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(int32_t))
-                        display_data(s->get_dataptr<const int32_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint32_t))
-                        display_data(s->get_dataptr<const uint32_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(int64_t))
-                        display_data(s->get_dataptr<const int64_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(uint64_t))
-                        display_data(s->get_dataptr<const uint64_t>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(float))
-                        display_data(s->get_dataptr<const float>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    else if (s->get_datatype() == typeid(double))
-                        display_data(s->get_dataptr<const double>(),
-                                     fra_size,
-                                     n_fra,
-                                     n_fra_per_w,
-                                     limit,
-                                     max_frame,
-                                     p,
-                                     (uint8_t)max_n_chars + 12,
-                                     h);
-                    std::cout << "]" << std::endl;
-                }
-            }
-            std::cout << "# Returned status: [";
-            // do not use 'this->status' because the dataptr can have been changed by the 'tools::Sequence' when using
-            // the no copy mode
-            int* status = this->sockets.back()->get_dataptr<int>();
-            for (size_t w = 0; w < this->get_module().get_n_waves(); w++)
-            {
-                if (status_t_to_string.count(status[w]))
-                    std::cout << ((w != 0) ? ", " : "") << std::dec << status[w] << " '"
-                              << status_t_to_string[status[w]] << "'";
-                else
-                    std::cout << ((w != 0) ? ", " : "") << std::dec << status[w];
-            }
-            std::cout << "]" << std::endl;
-            std::cout << "#" << std::noshowbase << std::endl;
-        }
-
-        // if (exec_status < 0)
-        // {
-        //  std::stringstream message;
-        //  message << "'exec_status' can't be negative ('exec_status' = " << exec_status << ").";
-        //  throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
-        // }
+        if (SPU_TASK_UNLIKELY(this->is_debug())) this->_exec_debug_after(max_n_chars);
 
         return this->get_status();
     }
     else
     {
-        std::stringstream input_socs;
-        std::stringstream output_socs;
-        input_socs << "'socket(s).name' = [";
-        output_socs << "'socket(s).name' = [";
-        auto s = 0;
-        for (size_t i = 0; i < sockets.size(); i++)
-        {
-            if (sockets[i]->dataptr == nullptr)
-            {
-                if (sockets[i]->get_type() == runtime::socket_t::SOUT)
-                {
-                    output_socs << (s != 0 ? ", " : "") << sockets[i]->name;
-                }
-                else
-                {
-                    input_socs << (s != 0 ? ", " : "") << sockets[i]->name;
-                }
-            }
-        }
-        std::stringstream message;
-        message << "The task ('task.name' = " << this->get_name() << ", 'module.name' = " << module->get_name()
-                << ", cannot be executed because : " << std::endl
-                << "The inputs/forward sockets : " << input_socs.str() << "] are not fed" << std::endl
-                << "The output sockets : " << output_socs.str() << "] are not allocated";
-        throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
+        this->throw_cannot_exec();
     }
-#endif /* !SPU_FAST */
 }
+#endif
 
 template<typename T>
 Socket&
@@ -1053,11 +1147,14 @@ void
 Task::create_codelet(std::function<int(module::Module& m, Task& t, const size_t frame_id)>& codelet)
 {
     this->codelet = codelet;
+    this->fast_codelet_fn = &Task::call_std_function_codelet;
 
     // create automatically a socket that contains the status of the task
     const bool hack_status = true;
     auto s = this->template create_2d_socket_out<int>("status", 1, this->get_module().get_n_waves(), hack_status);
     this->sockets[s]->dataptr = (void*)this->status.data();
+    this->status_socket = this->sockets[s].get();
+    this->status_dataptr_ptr = &this->status_socket->dataptr;
 
     if (tools::Buffer_allocator::get_task_autoalloc()) this->allocate_outbuffers();
 }
@@ -1065,6 +1162,7 @@ Task::create_codelet(std::function<int(module::Module& m, Task& t, const size_t 
 void
 Task::update_n_frames(const size_t old_n_frames, const size_t new_n_frames)
 {
+    this->update_fast_exec_flags();
     for (auto& s : this->sockets)
     {
         if (s->get_name() == "status")
@@ -1096,6 +1194,7 @@ Task::update_n_frames(const size_t old_n_frames, const size_t new_n_frames)
 void
 Task::update_n_frames_per_wave(const size_t /*old_n_frames_per_wave*/, const size_t new_n_frames_per_wave)
 {
+    this->update_fast_exec_flags();
     size_t s_id = 0;
     for (auto& s : this->sockets)
     {
@@ -1347,6 +1446,8 @@ Task::clone() const
         if (s_new->get_type() == socket_t::SIN || s_new->get_type() == socket_t::SFWD)
             t->last_input_socket = s_new.get();
     }
+    t->status_socket = t->sockets.empty() ? nullptr : t->sockets.back().get();
+    t->status_dataptr_ptr = t->status_socket ? &t->status_socket->dataptr : nullptr;
 
     if (tools::Buffer_allocator::get_task_autoalloc()) t->allocate_outbuffers();
 
