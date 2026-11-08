@@ -724,14 +724,17 @@ rt_separation2(const bool display_thr, std::ostream& stream)
 }
 
 void
-rt_show_columns_header(const bool display_thr, std::ostream& stream)
+rt_show_columns_header(const bool display_thr, const bool thr_in_frames, std::ostream& stream)
 {
     // clang-format off
     rt_separation2(display_thr, stream);
     if (display_thr)
     {
         stream << "# " << rang::style::bold << "       MODULE NAME |         TASK NAME | REP | ORDER ||    CALLS |     TIME ||  AVERAGE |  STD DEV |  MINIMUM |      P50 |      P90 |      P99 |    P99.9 |   P99.99 |  MAXIMUM ||  AVERAGE |   1% LOW |  0.1% LW | 0.01% LW |  MINIMUM " << rang::style::reset << std::endl;
-        stream << "# " << rang::style::bold << "                   |                   |     |       ||          |      (s) ||     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) ||   (Mb/s) |   (Mb/s) |   (Mb/s) |   (Mb/s) |   (Mb/s) " << rang::style::reset << std::endl;
+        if (thr_in_frames)
+            stream << "# " << rang::style::bold << "                   |                   |     |       ||          |      (s) ||     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) ||  (frm/s) |  (frm/s) |  (frm/s) |  (frm/s) |  (frm/s) " << rang::style::reset << std::endl;
+        else
+            stream << "# " << rang::style::bold << "                   |                   |     |       ||          |      (s) ||     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) |     (us) || (strm/s) | (strm/s) | (strm/s) | (strm/s) | (strm/s) " << rang::style::reset << std::endl;
     }
     else
     {
@@ -743,14 +746,17 @@ rt_show_columns_header(const bool display_thr, std::ostream& stream)
 }
 
 void
-rt_show_sequence_header(const bool display_thr, std::ostream& stream)
+rt_show_sequence_header(const bool display_thr, const bool thr_in_frames, std::ostream& stream)
 {
     // clang-format off
     rt_separation1(display_thr, stream);
     if (display_thr)
     {
         stream << "# " << rang::style::bold << "            Real-Time (RT) statistics for            ||   Basic statistics  ||                            Measured frame latency & jitter distribution                          ||             Measured throughput & lows               " << rang::style::reset << std::endl;
-        stream << "# " << rang::style::bold << "                tasks & the sequence                 ||   on the sequence   ||                                          (HDR histogram)                                         ||            considering the last socket               " << rang::style::reset << std::endl;
+        if (thr_in_frames)
+            stream << "# " << rang::style::bold << "                tasks & the sequence                 ||   on the sequence   ||                                          (HDR histogram)                                         ||                  (frames per second)                 " << rang::style::reset << std::endl;
+        else
+            stream << "# " << rang::style::bold << "                tasks & the sequence                 ||   on the sequence   ||                                          (HDR histogram)                                         ||                 (streams per second)                 " << rang::style::reset << std::endl;
     }
     else
     {
@@ -758,19 +764,22 @@ rt_show_sequence_header(const bool display_thr, std::ostream& stream)
         stream << "# " << rang::style::bold << "                tasks & the sequence                 ||   on the sequence   ||                                          (HDR histogram)                                         " << rang::style::reset << std::endl;
     }
     rt_separation1(display_thr, stream);
-    rt_show_columns_header(display_thr, stream);
+    rt_show_columns_header(display_thr, thr_in_frames, stream);
     // clang-format on
 }
 
 void
-rt_show_pipeline_stages_header(const bool display_thr, std::ostream& stream)
+rt_show_pipeline_stages_header(const bool display_thr, const bool thr_in_frames, std::ostream& stream)
 {
     // clang-format off
     rt_separation1(display_thr, stream);
     if (display_thr)
     {
         stream << "# " << rang::style::bold << "            Real-Time (RT) statistics for            ||   Basic statistics  ||                            Measured stage latency & jitter distribution                          ||             Measured throughput & lows               " << rang::style::reset << std::endl;
-        stream << "# " << rang::style::bold << "         pipeline stages (excluding wait time)       ||     on the stage    ||                                          (HDR histogram)                                         ||            considering the last socket               " << rang::style::reset << std::endl;
+        if (thr_in_frames)
+            stream << "# " << rang::style::bold << "         pipeline stages (excluding wait time)       ||     on the stage    ||                                          (HDR histogram)                                         ||                  (frames per second)                 " << rang::style::reset << std::endl;
+        else
+            stream << "# " << rang::style::bold << "         pipeline stages (excluding wait time)       ||     on the stage    ||                                          (HDR histogram)                                         ||                 (streams per second)                 " << rang::style::reset << std::endl;
     }
     else
     {
@@ -778,19 +787,22 @@ rt_show_pipeline_stages_header(const bool display_thr, std::ostream& stream)
         stream << "# " << rang::style::bold << "         pipeline stages (excluding wait time)       ||     on the stage    ||                                          (HDR histogram)                                         " << rang::style::reset << std::endl;
     }
     rt_separation1(display_thr, stream);
-    rt_show_columns_header(display_thr, stream);
+    rt_show_columns_header(display_thr, thr_in_frames, stream);
     // clang-format on
 }
 
 void
-rt_show_pipeline_e2e_header(const bool display_thr, std::ostream& stream)
+rt_show_pipeline_e2e_header(const bool display_thr, const bool thr_in_frames, std::ostream& stream)
 {
     // clang-format off
     rt_separation1(display_thr, stream);
     if (display_thr)
     {
         stream << "# " << rang::style::bold << "            Real-Time (RT) statistics for            ||   Basic statistics  ||                         Measured end-to-end latency & jitter distribution                        ||             Measured throughput & lows               " << rang::style::reset << std::endl;
-        stream << "# " << rang::style::bold << "       full pipeline (including wait & FIFO time)    ||   on the pipeline   ||                                          (HDR histogram)                                         ||            considering the last socket               " << rang::style::reset << std::endl;
+        if (thr_in_frames)
+            stream << "# " << rang::style::bold << "       full pipeline (including wait & FIFO time)    ||   on the pipeline   ||                                          (HDR histogram)                                         ||                  (frames per second)                 " << rang::style::reset << std::endl;
+        else
+            stream << "# " << rang::style::bold << "       full pipeline (including wait & FIFO time)    ||   on the pipeline   ||                                          (HDR histogram)                                         ||                 (streams per second)                 " << rang::style::reset << std::endl;
     }
     else
     {
@@ -876,7 +888,7 @@ rt_show_stats_row(const std::string& label_left,
                   const bool all_replicable,
                   const tools::Rt_stats& stats,
                   const double ns_per_tick,
-                  const size_t n_elmts,
+                  const size_t units_per_stream,
                   const double lat_divisor,
                   const bool show_thr_values,
                   const bool display_thr,
@@ -957,20 +969,20 @@ rt_show_stats_row(const std::string& label_left,
 
     if (display_thr)
     {
-        if (show_thr_values && n_elmts > 0)
+        if (show_thr_values && units_per_stream > 0)
         {
             const double t_avg = t_stats.get_avg_ticks() * us_per_tick;
             const double t_p99 = t_stats.get_percentile_ticks(99.0) * us_per_tick;
             const double t_p999 = t_stats.get_percentile_ticks(99.9) * us_per_tick;
             const double t_p9999 = t_stats.get_percentile_ticks(99.99) * us_per_tick;
             const double t_max = (double)t_stats.max_ticks * us_per_tick;
-            const double elmts_scaled = (double)n_elmts * n_thr_d;
+            const double unit_scale = 1e6 * (double)units_per_stream * n_thr_d;
 
-            const double avg_thr = (t_avg > 0.0) ? (elmts_scaled / t_avg) : 0.0;
-            const double low1_thr = (t_p99 > 0.0) ? (elmts_scaled / t_p99) : 0.0;
-            const double low01_thr = (t_p999 > 0.0) ? (elmts_scaled / t_p999) : 0.0;
-            const double low001_thr = (t_p9999 > 0.0) ? (elmts_scaled / t_p9999) : 0.0;
-            const double min_thr = (t_max > 0.0) ? (elmts_scaled / t_max) : 0.0;
+            const double avg_thr = (t_avg > 0.0) ? (unit_scale / t_avg) : 0.0;
+            const double low1_thr = (t_p99 > 0.0) ? (unit_scale / t_p99) : 0.0;
+            const double low01_thr = (t_p999 > 0.0) ? (unit_scale / t_p999) : 0.0;
+            const double low001_thr = (t_p9999 > 0.0) ? (unit_scale / t_p9999) : 0.0;
+            const double min_thr = (t_max > 0.0) ? (unit_scale / t_max) : 0.0;
 
             stream << rang::style::bold << " || " << rang::style::reset << wrap_style(rt_format_num(avg_thr))
                    << rang::style::bold << " | " << rang::style::reset << wrap_style(rt_format_num(low1_thr))
@@ -989,30 +1001,13 @@ rt_show_stats_row(const std::string& label_left,
     }
     stream << std::endl;
 }
-
-size_t
-rt_find_stage_n_elmts(const std::vector<std::vector<runtime::Task*>>& tasks_per_types)
-{
-    size_t n_elmts = 0;
-    for (size_t i = tasks_per_types.size(); i > 0; i--)
-    {
-        const auto& vt = tasks_per_types[i - 1];
-        if (!vt.empty() && vt[0] != nullptr && vt[0]->sockets.size() >= 2)
-        {
-            const size_t e = vt[0]->sockets.end()[-2]->get_n_elmts();
-            if (e > 0)
-            {
-                n_elmts = e;
-                break;
-            }
-        }
-    }
-    return n_elmts;
-}
 } // anonymous namespace
 
 void
-Statistics::show_rt(const runtime::Sequence& sequence, const bool display_thr, std::ostream& stream)
+Statistics::show_rt(const runtime::Sequence& sequence,
+                    const bool display_thr,
+                    const bool thr_in_frames,
+                    std::ostream& stream)
 {
     tools::Rt_stats merged;
     for (const auto& s : sequence.get_rt_stats_per_thread())
@@ -1026,7 +1021,7 @@ Statistics::show_rt(const runtime::Sequence& sequence, const bool display_thr, s
         return;
     }
 
-    rt_show_sequence_header(display_thr, stream);
+    rt_show_sequence_header(display_thr, thr_in_frames, stream);
 
     const auto tasks_per_types = sequence.get_tasks_per_types();
     bool all_replicable = true;
@@ -1045,7 +1040,7 @@ Statistics::show_rt(const runtime::Sequence& sequence, const bool display_thr, s
     rt_separation2(display_thr, stream);
 
     const size_t n_tasks = tasks_per_types.size();
-    const size_t n_elmts = rt_find_stage_n_elmts(tasks_per_types);
+    const size_t units_per_stream = thr_in_frames ? std::max<size_t>(1, sequence.get_n_frames()) : 1;
     const double ns_per_tick = sequence.get_rt_ns_per_tick();
 
     rt_show_stats_row("SEQUENCE",
@@ -1053,7 +1048,7 @@ Statistics::show_rt(const runtime::Sequence& sequence, const bool display_thr, s
                       all_replicable,
                       merged,
                       ns_per_tick,
-                      n_elmts,
+                      units_per_stream,
                       1.0,
                       true,
                       display_thr,
@@ -1069,7 +1064,7 @@ Statistics::show_rt(const runtime::Sequence& sequence, const bool display_thr, s
                           all_replicable,
                           merged,
                           ns_per_tick,
-                          n_elmts,
+                          units_per_stream,
                           (double)n_tasks,
                           false,
                           display_thr,
@@ -1081,7 +1076,10 @@ Statistics::show_rt(const runtime::Sequence& sequence, const bool display_thr, s
 }
 
 void
-Statistics::show_rt(const runtime::Pipeline& pipeline, const bool display_thr, std::ostream& stream)
+Statistics::show_rt(const runtime::Pipeline& pipeline,
+                    const bool display_thr,
+                    const bool thr_in_frames,
+                    std::ostream& stream)
 {
     const auto stages = pipeline.get_stages();
     if (stages.empty()) return;
@@ -1099,7 +1097,7 @@ Statistics::show_rt(const runtime::Pipeline& pipeline, const bool display_thr, s
         return;
     }
 
-    rt_show_pipeline_stages_header(display_thr, stream);
+    rt_show_pipeline_stages_header(display_thr, thr_in_frames, stream);
 
     size_t global_order = 0;
     bool all_pipeline_replicable = true;
@@ -1133,7 +1131,7 @@ Statistics::show_rt(const runtime::Pipeline& pipeline, const bool display_thr, s
         rt_separation2(display_thr, stream);
 
         const size_t n_tasks = tasks_per_types.size();
-        const size_t n_elmts = rt_find_stage_n_elmts(tasks_per_types);
+        const size_t units_per_stream = thr_in_frames ? std::max<size_t>(1, stage->get_n_frames()) : 1;
         const double ns_per_tick = stage->get_rt_ns_per_tick();
 
         rt_show_stats_row("STAGE " + std::to_string(sta) + " (" + std::to_string(stage->get_n_threads()) + "t)",
@@ -1141,7 +1139,7 @@ Statistics::show_rt(const runtime::Pipeline& pipeline, const bool display_thr, s
                           stage_replicable,
                           stage_merged,
                           ns_per_tick,
-                          n_elmts,
+                          units_per_stream,
                           1.0,
                           true,
                           display_thr,
@@ -1157,7 +1155,7 @@ Statistics::show_rt(const runtime::Pipeline& pipeline, const bool display_thr, s
                               stage_replicable,
                               stage_merged,
                               ns_per_tick,
-                              n_elmts,
+                              units_per_stream,
                               (double)n_tasks,
                               false,
                               display_thr,
@@ -1182,19 +1180,18 @@ Statistics::show_rt(const runtime::Pipeline& pipeline, const bool display_thr, s
     for (const auto& s : stages.back()->get_pipeline_inter_rt_stats_per_thread())
         inter_merged.merge(s);
 
-    const auto last_tasks = stages.back()->get_tasks_per_types();
-    const size_t e2e_n_elmts = rt_find_stage_n_elmts(last_tasks);
+    const size_t e2e_units_per_stream = thr_in_frames ? std::max<size_t>(1, stages.back()->get_n_frames()) : 1;
     const double ns_per_tick = stages.back()->get_rt_ns_per_tick();
     const size_t last_n_threads = stages.back()->get_n_threads();
 
-    rt_show_pipeline_e2e_header(display_thr, stream);
+    rt_show_pipeline_e2e_header(display_thr, thr_in_frames, stream);
 
     rt_show_stats_row("PIPELINE E2E",
                       "end-to-end",
                       all_pipeline_replicable,
                       e2e_merged,
                       ns_per_tick,
-                      e2e_n_elmts,
+                      e2e_units_per_stream,
                       1.0,
                       true,
                       display_thr,

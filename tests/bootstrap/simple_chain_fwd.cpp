@@ -25,6 +25,7 @@ main(int argc, char** argv)
                           { "print-stats", no_argument, NULL, 'p' },
                           { "rt-stats", no_argument, NULL, 'r' },
                           { "rt-skip", required_argument, NULL, 'R' },
+                          { "rt-frames", no_argument, NULL, 'F' },
                           { "step-by-step", no_argument, NULL, 'b' },
                           { "debug", no_argument, NULL, 'g' },
                           { "verbose", no_argument, NULL, 'v' },
@@ -38,6 +39,7 @@ main(int argc, char** argv)
     size_t data_length = 2048;
     size_t n_exec = 100000;
     size_t rt_skip = 0;
+    bool rt_frames = false;
     std::string dot_filepath;
     bool no_copy_mode = true;
     bool print_stats = false;
@@ -49,7 +51,7 @@ main(int argc, char** argv)
 
     while (1)
     {
-        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:R:cprbgvkh", longopts, 0);
+        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:R:Fcprbgvkh", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -82,6 +84,9 @@ main(int argc, char** argv)
                 break;
             case 'R':
                 rt_skip = atoi(optarg);
+                break;
+            case 'F':
+                rt_frames = true;
                 break;
             case 'b':
                 step_by_step = true;
@@ -128,6 +133,12 @@ main(int argc, char** argv)
                 std::cout << "  -r, --rt-stats        "
                           << "Enable Real-Time sequence latency/jitter/throughput statistics        "
                           << "[" << (rt_stats ? "true" : "false") << "]" << std::endl;
+                std::cout << "  -R, --rt-skip         "
+                          << "Number of initial frames per thread to skip in RT statistics          "
+                          << "[" << rt_skip << "]" << std::endl;
+                std::cout << "  -F, --rt-frames       "
+                          << "Display RT throughput in frames/s instead of streams/s                "
+                          << "[" << (rt_frames ? "true" : "false") << "]" << std::endl;
                 std::cout << "  -g, --debug           "
                           << "Enable task debug mode (print socket data)                            "
                           << "[" << (debug ? "true" : "false") << "]" << std::endl;
@@ -302,7 +313,7 @@ main(int argc, char** argv)
     if (rt_stats)
     {
         std::cout << "#" << std::endl;
-        tools::Stats::show_rt(sequence_chain, true);
+        tools::Stats::show_rt(sequence_chain, true, rt_frames);
     }
 
     // sockets unbinding

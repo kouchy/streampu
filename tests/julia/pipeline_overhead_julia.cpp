@@ -132,7 +132,8 @@ run_linear_jl_pipeline_case(const std::string& name,
                             const size_t data_length,
                             const size_t n_exec,
                             const size_t n_skip_frames,
-                            const bool show_rt_table = false)
+                            const bool show_rt_table = false,
+                            const bool rt_frames = false)
 {
     const size_t total_tasks = n_stages * tasks_per_stage;
     std::vector<std::unique_ptr<module::Stateless_Julia>> mods(total_tasks);
@@ -180,7 +181,7 @@ run_linear_jl_pipeline_case(const std::string& name,
     if (show_rt_table)
     {
         std::cout << "#" << std::endl;
-        tools::Stats::show_rt(pipe, true);
+        tools::Stats::show_rt(pipe, true, rt_frames);
     }
 
     pipe.unbind_adaptors();
@@ -199,17 +200,20 @@ main(int argc, char** argv)
     size_t n_exec = 50000;
     size_t data_length = 64;
     size_t n_skip_frames = 0;
+    bool rt_frames = false;
     bool show_full_rt_tables = false;
 
-    const option longopts[] = {
-        { "n-exec", required_argument, NULL, 'e' },  { "data-length", required_argument, NULL, 'd' },
-        { "rt-skip", required_argument, NULL, 'k' }, { "rt-stats", no_argument, NULL, 'r' },
-        { "help", no_argument, NULL, 'h' },          { 0, 0, 0, 0 }
-    };
+    const option longopts[] = { { "n-exec", required_argument, NULL, 'e' },
+                                { "data-length", required_argument, NULL, 'd' },
+                                { "rt-skip", required_argument, NULL, 'k' },
+                                { "rt-frames", no_argument, NULL, 'F' },
+                                { "rt-stats", no_argument, NULL, 'r' },
+                                { "help", no_argument, NULL, 'h' },
+                                { 0, 0, 0, 0 } };
 
     while (true)
     {
-        const int opt = getopt_long(argc, argv, "e:d:k:rh", longopts, 0);
+        const int opt = getopt_long(argc, argv, "e:d:k:R:Frh", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -220,13 +224,17 @@ main(int argc, char** argv)
                 data_length = std::atoi(optarg);
                 break;
             case 'k':
+            case 'R':
                 n_skip_frames = std::atoi(optarg);
+                break;
+            case 'F':
+                rt_frames = true;
                 break;
             case 'r':
                 show_full_rt_tables = true;
                 break;
             case 'h':
-                std::cout << "usage: " << argv[0] << " [-e n_exec] [-d data_length] [-k rt_skip_frames] [-r]"
+                std::cout << "usage: " << argv[0] << " [-e n_exec] [-d data_length] [-k rt_skip_frames] [-F] [-r]"
                           << std::endl;
                 return 0;
             default:
@@ -298,7 +306,8 @@ main(int argc, char** argv)
                                           data_length,
                                           n_exec,
                                           n_skip_frames,
-                                          show_full_rt_tables && (n_stg == 4 && bsize == 1)));
+                                          show_full_rt_tables && (n_stg == 4 && bsize == 1),
+                                          rt_frames));
         }
     }
 

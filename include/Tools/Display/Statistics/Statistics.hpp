@@ -210,12 +210,23 @@ class Statistics
 
     /*!
      * \brief Displays Real-Time (RT) frame-level latency percentiles (Min, Avg, Std, P50, P90, P99, P99.9, P99.99,
-     *        Max) and throughput tail metrics (Avg, 1% low, 0.1% low, 0.01% low) for a Sequence.
+     *        Max) and throughput tail metrics (Avg, 1% low, 0.1% low, 0.01% low, Min) for a Sequence.
      *        Requires `sequence.set_rt_stats(true, n_skip_frames)` to be called prior to execution.
+     * \param sequence:       Sequence whose RT statistics are displayed.
+     * \param display_thr:    true to display the throughput columns (default: true).
+     * \param thr_in_frames:  false to display throughput in streams/s (`strm/s`), true to display in frames/s (`frm/s`,
+     *                        multiplying the stream rate by `sequence.get_n_frames()`) (default: false).
+     * \param stream:         Output stream (default: `std::cout`).
      */
     static void show_rt(const runtime::Sequence& sequence,
                         const bool display_thr = true,
+                        const bool thr_in_frames = false,
                         std::ostream& stream = std::cout);
+
+    static inline void show_rt(const runtime::Sequence& sequence, const bool display_thr, std::ostream& stream)
+    {
+        Statistics::show_rt(sequence, display_thr, false, stream);
+    }
 
     /*!
      * \brief Displays Real-Time (RT) frame-level latency percentiles and throughput tail metrics for a Pipeline:
@@ -223,10 +234,21 @@ class Statistics
      *        2) End-to-End (`PIPELINE E2E`) statistics from the start of stage 0 to the end of the last stage
      *           (including inter-stage wait and FIFO queuing time).
      *        Requires `pipeline.set_rt_stats(true, n_skip_frames)` to be called prior to execution.
+     * \param pipeline:       Pipeline whose RT statistics are displayed.
+     * \param display_thr:    true to display the throughput columns (default: true).
+     * \param thr_in_frames:  false to display throughput in streams/s (`strm/s`), true to display in frames/s (`frm/s`,
+     *                        multiplying the stream rate by `stage->get_n_frames()`) (default: false).
+     * \param stream:         Output stream (default: `std::cout`).
      */
     static void show_rt(const runtime::Pipeline& pipeline,
                         const bool display_thr = true,
+                        const bool thr_in_frames = false,
                         std::ostream& stream = std::cout);
+
+    static inline void show_rt(const runtime::Pipeline& pipeline, const bool display_thr, std::ostream& stream)
+    {
+        Statistics::show_rt(pipeline, display_thr, false, stream);
+    }
 
   private:
     template<class MODULE = const module::Module>

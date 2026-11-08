@@ -26,6 +26,7 @@ main(int argc, char** argv)
                           { "print-stats", no_argument, NULL, 'p' },
                           { "rt-stats", no_argument, NULL, 'r' },
                           { "rt-skip", required_argument, NULL, 'R' },
+                          { "rt-frames", no_argument, NULL, 'F' },
                           { "step-by-step", no_argument, NULL, 'b' },
                           { "jl-safe", no_argument, NULL, 'J' },
                           { "jl-extern", no_argument, NULL, 'E' },
@@ -44,6 +45,7 @@ main(int argc, char** argv)
     bool print_stats = false;
     bool rt_stats = false;
     size_t rt_skip = 0;
+    bool rt_frames = false;
     bool step_by_step = false;
     bool debug = false;
     bool verbose = false;
@@ -52,7 +54,7 @@ main(int argc, char** argv)
 
     while (1)
     {
-        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:cprR:bgvhJE", longopts, 0);
+        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:cprR:FbgvhJE", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -85,6 +87,9 @@ main(int argc, char** argv)
                 break;
             case 'R':
                 rt_skip = atoi(optarg);
+                break;
+            case 'F':
+                rt_frames = true;
                 break;
             case 'b':
                 step_by_step = true;
@@ -137,6 +142,9 @@ main(int argc, char** argv)
                 std::cout << "  -R, --rt-skip         "
                           << "Number of initial frames per thread to skip in RT statistics          "
                           << "[" << rt_skip << "]" << std::endl;
+                std::cout << "  -F, --rt-frames       "
+                          << "Display RT throughput in frames/s instead of streams/s                "
+                          << "[" << (rt_frames ? "true" : "false") << "]" << std::endl;
                 std::cout << "  -J, --jl-safe         "
                           << "Enable Julia safe mode (throw exceptions to C++)                      "
                           << "[" << (jl_safe ? "true" : "false") << "]" << std::endl;
@@ -356,7 +364,7 @@ main(int argc, char** argv)
     if (rt_stats)
     {
         std::cout << "#" << std::endl;
-        tools::Stats::show_rt(sequence_chain, true);
+        tools::Stats::show_rt(sequence_chain, true, rt_frames);
     }
 
     // sockets unbinding

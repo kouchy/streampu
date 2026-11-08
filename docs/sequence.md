@@ -208,10 +208,10 @@ When `sequence.set_rt_stats(true, n_skip_frames)` is enabled:
 2. **$O(1)$ lock-free HDR histogram (`spu::tools::Rt_stats`)**: Each worker thread records frame durations in a pre-allocated thread-local sub-bucketed logarithmic histogram (1024 bins = 32 power-of-2 buckets $\times$ 32 linear sub-bins, $< 0.8\%$ relative quantization error, zero heap allocation).
 3. **Warmup frame skipping (`n_skip_frames`)**: The optional `n_skip_frames` parameter (default `0`) discards the first `n_skip_frames` executions on each thread before accumulating statistics, filtering out cold-cache misses, OS page faults, CPU frequency scaling (DVFS), or Julia JIT compilation transients.
 
-To display the collected Real-Time latency percentiles (`Min`, `Avg`, `Std`, `P50`, `P90`, `P99`, `P99.9`, `P99.99`, `Max`) and tail throughputs (`Avg`, `1% low`, `0.1% low`, `0.01% low`), call `spu::tools::Stats::show_rt`:
+To display the collected Real-Time latency percentiles (`Min`, `Avg`, `Std`, `P50`, `P90`, `P99`, `P99.9`, `P99.99`, `Max`) and tail throughputs (`Avg`, `1% low`, `0.1% low`, `0.01% low`, `Min`) in streams/s (`thr_in_frames = false`, default) or frames/s (`thr_in_frames = true`, multiplying by `sequence.get_n_frames()`), call `spu::tools::Stats::show_rt`:
 
 ```cpp
 sequence.set_rt_stats(true, /*n_skip_frames=*/100);
 sequence.exec_seq(); // or sequence.exec(...)
-tools::Stats::show_rt(sequence);
+tools::Stats::show_rt(sequence, /*display_thr=*/true, /*thr_in_frames=*/false);
 ```

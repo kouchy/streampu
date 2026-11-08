@@ -126,16 +126,20 @@ main(int argc, char** argv)
     option longopts[] = { { "n-exec", required_argument, NULL, 'e' },
                           { "data-length", required_argument, NULL, 'd' },
                           { "rt-stats", no_argument, NULL, 'r' },
+                          { "rt-skip", required_argument, NULL, 'R' },
+                          { "rt-frames", no_argument, NULL, 'F' },
                           { "help", no_argument, NULL, 'h' },
                           { NULL, 0, NULL, 0 } };
 
     size_t n_exec = 200000;
     size_t data_length = 64;
+    size_t rt_skip = 0;
+    bool rt_frames = false;
     bool show_full_rt_tables = false;
 
     while (1)
     {
-        const int opt = getopt_long(argc, argv, "e:d:rh", longopts, 0);
+        const int opt = getopt_long(argc, argv, "e:d:R:Frh", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -148,6 +152,12 @@ main(int argc, char** argv)
             case 'r':
                 show_full_rt_tables = true;
                 break;
+            case 'R':
+                rt_skip = atoi(optarg);
+                break;
+            case 'F':
+                rt_frames = true;
+                break;
             case 'h':
                 std::cout << "usage: " << argv[0] << " [options]" << std::endl;
                 std::cout << "  -e, --n-exec       Number of sequence executions per benchmark [" << n_exec << "]"
@@ -155,6 +165,9 @@ main(int argc, char** argv)
                 std::cout << "  -d, --data-length  Socket buffer length in bytes               [" << data_length << "]"
                           << std::endl;
                 std::cout << "  -r, --rt-stats     Also print full tools::Stats::show_rt tables [false]" << std::endl;
+                std::cout << "  -R, --rt-skip      Number of initial frames to skip in RT      [" << rt_skip << "]"
+                          << std::endl;
+                std::cout << "  -F, --rt-frames    Display RT throughput in frames/s           [false]" << std::endl;
                 return 0;
             default:
                 break;
@@ -252,10 +265,10 @@ main(int argc, char** argv)
             if (show_full_rt_tables && !jl_safe && use_fwd)
             {
                 seq.reset_rt_stats();
-                seq.set_rt_stats(true);
+                seq.set_rt_stats(true, rt_skip);
                 size_t c = 0;
                 seq.exec([&c, cur_exec]() { return ++c >= cur_exec; });
-                tools::Stats::show_rt(seq, true);
+                tools::Stats::show_rt(seq, true, rt_frames);
             }
         }
     }

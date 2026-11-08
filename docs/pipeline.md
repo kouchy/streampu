@@ -195,10 +195,10 @@ When `pipeline.set_rt_stats(true, n_skip_frames)` is called before `pipeline.exe
     - When the final stage finishes its last task for a frame, it records `t_end - cur_frame_birth_ts` into `pipeline_e2e_rt_stats_per_thread`, capturing the true end-to-end traversal latency of the frame through all stages and inter-stage FIFOs.
 3. **Warmup frame skipping (`n_skip_frames`)**: Passing `n_skip_frames > 0` discards the first `n_skip_frames` executions per thread in each stage before accumulating statistics.
 
-Display both the per-stage processing table and the End-to-End (`PIPELINE E2E`) summary table with:
+Display both the per-stage processing table and the End-to-End (`PIPELINE E2E`) summary table in streams/s (`thr_in_frames = false`, default) or frames/s (`thr_in_frames = true`, multiplying by `stage->get_n_frames()`) with:
 
 ```cpp
 pipeline.set_rt_stats(true, /*n_skip_frames=*/100);
 pipeline.exec();
-tools::Stats::show_rt(pipeline);
+tools::Stats::show_rt(pipeline, /*display_thr=*/true, /*thr_in_frames=*/false);
 ```
