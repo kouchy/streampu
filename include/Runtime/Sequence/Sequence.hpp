@@ -19,6 +19,7 @@
 #include "Module/Module.hpp"
 #include "Runtime/Socket/Socket.hpp"
 #include "Tools/Algo/Digraph/Digraph_node.hpp"
+#include "Tools/Display/Statistics/Statistics.hpp"
 #include "Tools/Interface/Interface_clone.hpp"
 #include "Tools/Interface/Interface_get_set_n_frames.hpp"
 #include "Tools/Interface/Interface_is_done.hpp"
@@ -106,6 +107,7 @@ class Sequence
 {
     friend Pipeline;
     friend sched::Scheduler;
+    friend tools::Statistics;
 
   protected:
     const size_t n_threads;
@@ -144,6 +146,21 @@ class Sequence
 
     // is memory allocation enabled?
     bool memory_allocation;
+
+    // Real-Time (RT) latency and jitter statistics state (enabled via `set_rt_stats(true, n_skip_frames)`).
+    bool rt_stats;                                    // true when RT frame-level profiling is active
+    size_t rt_stats_skip_frames;                      // number of warmup executions to skip per thread
+    bool is_first_pipeline_stage;                     // true when this Sequence is stage 0 of a Pipeline
+    bool is_last_pipeline_stage;                      // true when this Sequence is the final stage of a Pipeline
+    double rt_ns_per_tick;                            // calibrated nanoseconds per `tools::read_tsc()` tick
+    std::vector<size_t> rt_stats_skipped_per_thread;  // count of skipped warmup executions per thread
+    std::vector<tools::Rt_stats> rt_stats_per_thread; // per-thread sequence/stage processing latency (excl. wait)
+    std::vector<tools::Rt_stats>
+      pipeline_e2e_rt_stats_per_thread; // per-thread Pipeline end-to-end latency (incl. wait & FIFO)
+    std::vector<tools::Rt_stats>
+      pipeline_inter_rt_stats_per_thread;     // per-thread inter-frame wall-clock period at pipeline output
+    std::vector<uint64_t> cur_frame_birth_ts; // per-thread birth timestamp of the current frame in stage 0
+    std::vector<uint64_t> cur_stage_start_ts; // per-thread start timestamp of the current stage execution
 
   public:
     Sequence(const std::vector<const runtime::Task*>& firsts,
@@ -318,6 +335,21 @@ class Sequence
 
     void set_auto_stop(const bool auto_stop);
     bool is_auto_stop() const;
+
+    /*!
+     * \brief Enables or disables low-overhead Real-Time (RT) frame latency and jitter profiling on this Sequence.
+     * \param rt_stats: true to record per-execution hardware timestamps into lock-free `tools::Rt_stats` histograms.
+     * \param n_skip_frames: number of initial executions per thread to discard before recording statistics
+     *                       (useful to ignore cold-cache, page-fault, DVFS, or JIT warmup transients; default: 0).
+     */
+    void set_rt_stats(const bool rt_stats, const size_t n_skip_frames = 0);
+    bool is_rt_stats() const;
+    size_t get_rt_stats_skip_frames() const;
+    void reset_rt_stats();
+    const std::vector<tools::Rt_stats>& get_rt_stats_per_thread() const;
+    const std::vector<tools::Rt_stats>& get_pipeline_e2e_rt_stats_per_thread() const;
+    const std::vector<tools::Rt_stats>& get_pipeline_inter_rt_stats_per_thread() const;
+    double get_rt_ns_per_tick() const;
 
     inline size_t get_n_frames() const;
     void set_n_frames(const size_t n_frames);

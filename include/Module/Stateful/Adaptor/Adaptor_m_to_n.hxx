@@ -44,6 +44,11 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
   , cloned(false)
   , cur_push_id(0)
   , cur_pull_id(0)
+  , ts_buffer(new std::vector<std::vector<uint64_t>>(1, std::vector<uint64_t>(buffer_size, 0)))
+  , push_birth_ts_ptr(nullptr)
+  , push_stage_start_ts_ptr(nullptr)
+  , pull_birth_ts_ptr(nullptr)
+  , pull_stage_start_ts_ptr(nullptr)
 {
     const std::string name = "Adaptor_m_to_n";
     this->set_name(name);

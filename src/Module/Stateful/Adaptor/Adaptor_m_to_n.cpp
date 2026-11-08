@@ -3,6 +3,7 @@
 #endif
 
 #include "Module/Stateful/Adaptor/Adaptor_m_to_n.hpp"
+#include "Tools/Display/Statistics/Statistics.hpp"
 #include "Tools/Math/utils.h"
 
 using namespace spu;
@@ -41,6 +42,10 @@ Adaptor_m_to_n::deep_copy(const Adaptor_m_to_n& m)
     this->tid_pull = -1;
     this->cur_push_id = -1;
     this->cur_pull_id = -1;
+    this->push_birth_ts_ptr = nullptr;
+    this->push_stage_start_ts_ptr = nullptr;
+    this->pull_birth_ts_ptr = nullptr;
+    this->pull_stage_start_ts_ptr = nullptr;
 }
 
 void
@@ -72,6 +77,7 @@ Adaptor_m_to_n::alloc_buffers()
 
     this->buffer->resize(ppcm,
                          std::vector<std::vector<int8_t*>>(this->n_sockets, std::vector<int8_t*>(this->buffer_size)));
+    this->ts_buffer->resize(ppcm, std::vector<uint64_t>(this->buffer_size, 0));
 
     if (this->buffer_to_free.size())
     {
@@ -281,10 +287,14 @@ Adaptor_m_to_n::wait_push()
     // When the inter-stage buffer is full, a thread registered with the Julia runtime ('jl_get_pgcstack() != nullptr')
     // must enter GC_SAFE before blocking (active spin-wait or passive condition_variable wait) so that another pipeline
     // stage running Julia tasks can execute a Stop-The-World GC cycle and drain the buffer without deadlocking.
+    // When Real-Time pipeline statistics are enabled (`push_stage_start_ts_ptr != nullptr`), the time spent blocked
+    // waiting for a free downstream slot is added to `*push_stage_start_ts_ptr` so it is subtracted from this stage's
+    // pure processing latency (`t_end - cur_stage_start_ts`).
     if (this->active_waiting)
     {
         if (this->is_full(this->cur_push_id) && !*this->waiting_canceled)
         {
+            const uint64_t t_wait_start = (this->push_stage_start_ts_ptr != nullptr) ? tools::read_tsc() : 0;
 #ifdef SPU_JULIA
             int8_t gc_state = 0;
             const bool can_safe = (jl_get_pgcstack() != nullptr);
@@ -295,12 +305,15 @@ Adaptor_m_to_n::wait_push()
 #ifdef SPU_JULIA
             if (can_safe) jl_gc_safe_leave(jl_current_task->ptls, gc_state);
 #endif
+            if (this->push_stage_start_ts_ptr != nullptr)
+                *this->push_stage_start_ts_ptr += (tools::read_tsc() - t_wait_start);
         }
     }
     else // passive waiting
     {
         if (this->is_full(this->cur_push_id) && !*this->waiting_canceled)
         {
+            const uint64_t t_wait_start = (this->push_stage_start_ts_ptr != nullptr) ? tools::read_tsc() : 0;
 #ifdef SPU_JULIA
             int8_t gc_state = 0;
             const bool can_safe = (jl_get_pgcstack() != nullptr);
@@ -314,6 +327,8 @@ Adaptor_m_to_n::wait_push()
 #ifdef SPU_JULIA
             if (can_safe) jl_gc_safe_leave(jl_current_task->ptls, gc_state);
 #endif
+            if (this->push_stage_start_ts_ptr != nullptr)
+                *this->push_stage_start_ts_ptr += (tools::read_tsc() - t_wait_start);
         }
     }
 
@@ -370,6 +385,15 @@ Adaptor_m_to_n::wait_pull()
 
     if (this->is_empty(this->cur_pull_id) && *this->waiting_canceled)
         throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
+
+    // When Real-Time pipeline statistics are enabled, record the exact timestamp at which `wait_pull()` unblocks
+    // (so idle waiting time is excluded from this stage's own processing latency) and retrieve the frame's birth
+    // timestamp from the shared ring buffer slot before `wake_up_pusher()` releases the slot.
+    if (this->pull_stage_start_ts_ptr != nullptr)
+    {
+        *this->pull_stage_start_ts_ptr = tools::read_tsc();
+        *this->pull_birth_ts_ptr = (*this->ts_buffer)[this->cur_pull_id][(*this->first)[this->cur_pull_id]];
+    }
 }
 
 void*
@@ -435,6 +459,11 @@ Adaptor_m_to_n::get_filled_buffer(const size_t sid, void* swap_buffer)
 void
 Adaptor_m_to_n::wake_up_puller()
 {
+    // Forward the current frame's birth timestamp into the ring buffer slot before `counter--` publishes the slot
+    // to the downstream puller thread (works identically in both `copy` and `no_copy` modes).
+    if (this->push_birth_ts_ptr != nullptr)
+        (*this->ts_buffer)[this->cur_push_id][(*this->last)[this->cur_push_id]] = *this->push_birth_ts_ptr;
+
     (*this->last)[this->cur_push_id] = ((*this->last)[this->cur_push_id] + 1) % this->buffer_size;
     (*this->counter)[this->cur_push_id]--; // atomic fetch sub
 

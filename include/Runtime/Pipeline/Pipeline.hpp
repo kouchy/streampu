@@ -18,10 +18,16 @@
 
 namespace spu
 {
+namespace tools
+{
+class Statistics;
+}
 namespace runtime
 {
 class Pipeline : public tools::Interface_get_set_n_frames
 {
+    friend tools::Statistics;
+
   protected:
     Sequence original_sequence;
     std::vector<std::shared_ptr<Sequence>> stages;
@@ -44,6 +50,7 @@ class Pipeline : public tools::Interface_get_set_n_frames
 
     bool bound_adaptors;
     bool auto_stop;
+    bool rt_stats;
 
   public:
     // Pipeline(const runtime::Task &first,
@@ -178,6 +185,7 @@ class Pipeline : public tools::Interface_get_set_n_frames
     void exec();
 
     std::vector<Sequence*> get_stages();
+    std::vector<const Sequence*> get_stages() const;
     Sequence& operator[](const size_t stage_id);
 
     template<class C = module::Module>
@@ -200,6 +208,19 @@ class Pipeline : public tools::Interface_get_set_n_frames
 
     void set_auto_stop(const bool auto_stop);
     bool is_auto_stop() const;
+
+    /*!
+     * \brief Enables or disables low-overhead Real-Time (RT) frame latency and jitter profiling across all Pipeline
+     *        stages and inter-stage `Adaptor_m_to_n` modules.
+     * \param rt_stats: true to record per-stage processing latencies (excluding wait time) and End-to-End (`PIPELINE
+     * E2E`) frame latencies (propagating frame birth timestamps through `Adaptor_m_to_n::ts_buffer`). \param
+     * n_skip_frames: number of initial executions per thread to discard in each stage before recording statistics
+     *                       (default: 0).
+     */
+    void set_rt_stats(const bool rt_stats, const size_t n_skip_frames = 0);
+    bool is_rt_stats() const;
+    size_t get_rt_stats_skip_frames() const;
+    void reset_rt_stats();
 
     size_t get_n_frames() const;
     void set_n_frames(const size_t n_frames);

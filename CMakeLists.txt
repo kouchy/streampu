@@ -223,6 +223,16 @@ if(SPU_TESTS)
     set_target_properties(spu-test-simple-pipeline PROPERTIES OUTPUT_NAME test-simple-pipeline POSITION_INDEPENDENT_CODE ON)
     list(APPEND spu_targets_list spu-test-simple-pipeline)
 
+    add_executable(spu-test-sequence-overhead $<TARGET_OBJECTS:spu-obj>
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tests/bootstrap/sequence_overhead.cpp)
+    set_target_properties(spu-test-sequence-overhead PROPERTIES OUTPUT_NAME test-sequence-overhead POSITION_INDEPENDENT_CODE ON)
+    list(APPEND spu_targets_list spu-test-sequence-overhead)
+
+    add_executable(spu-test-pipeline-overhead $<TARGET_OBJECTS:spu-obj>
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tests/bootstrap/pipeline_overhead.cpp)
+    set_target_properties(spu-test-pipeline-overhead PROPERTIES OUTPUT_NAME test-pipeline-overhead POSITION_INDEPENDENT_CODE ON)
+    list(APPEND spu_targets_list spu-test-pipeline-overhead)
+
     add_executable(spu-test-pipeline-probe $<TARGET_OBJECTS:spu-obj>
                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/advanced/pipeline_probe.cpp)
     set_target_properties(spu-test-pipeline-probe PROPERTIES OUTPUT_NAME test-pipeline-probe POSITION_INDEPENDENT_CODE ON)
@@ -302,6 +312,14 @@ if(SPU_TESTS)
         add_executable(spu-test-simple-pipeline-julia $<TARGET_OBJECTS:spu-obj> ${CMAKE_CURRENT_SOURCE_DIR}/tests/julia/simple_pipeline_julia.cpp)
         set_target_properties(spu-test-simple-pipeline-julia PROPERTIES OUTPUT_NAME test-simple-pipeline-julia POSITION_INDEPENDENT_CODE ON)
         list(APPEND spu_targets_list spu-test-simple-pipeline-julia)
+
+        add_executable(spu-test-sequence-overhead-julia $<TARGET_OBJECTS:spu-obj> ${CMAKE_CURRENT_SOURCE_DIR}/tests/julia/sequence_overhead_julia.cpp)
+        set_target_properties(spu-test-sequence-overhead-julia PROPERTIES OUTPUT_NAME test-sequence-overhead-julia POSITION_INDEPENDENT_CODE ON)
+        list(APPEND spu_targets_list spu-test-sequence-overhead-julia)
+
+        add_executable(spu-test-pipeline-overhead-julia $<TARGET_OBJECTS:spu-obj> ${CMAKE_CURRENT_SOURCE_DIR}/tests/julia/pipeline_overhead_julia.cpp)
+        set_target_properties(spu-test-pipeline-overhead-julia PROPERTIES OUTPUT_NAME test-pipeline-overhead-julia POSITION_INDEPENDENT_CODE ON)
+        list(APPEND spu_targets_list spu-test-pipeline-overhead-julia)
 
         if(NOT APPLE)
             add_executable(spu-test-jl_adopt_thread-julia $<TARGET_OBJECTS:spu-obj> ${CMAKE_CURRENT_SOURCE_DIR}/tests/julia/sandbox/jl_adopt_thread.cpp)

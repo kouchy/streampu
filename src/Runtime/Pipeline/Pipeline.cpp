@@ -81,7 +81,8 @@ Pipeline
   saved_firsts_tasks_id(sep_stages.size()),
   saved_lasts_tasks_id(sep_stages.size()),
   bound_adaptors(false),
-  auto_stop(true)
+  auto_stop(true),
+  rt_stats(false)
 {
     this->init<runtime::Task>(
       firsts, lasts, sep_stages, n_threads, synchro_buffer_sizes, synchro_active_waiting, thread_pinning, puids
@@ -104,7 +105,8 @@ Pipeline
   saved_firsts_tasks_id(sep_stages.size()),
   saved_lasts_tasks_id(sep_stages.size()),
   bound_adaptors(false),
-  auto_stop(true)
+  auto_stop(true),
+  rt_stats(false)
 {
     std::vector<std::tuple<std::vector<runtime::Task*>, std::vector<runtime::Task*>, std::vector<runtime::Task*>>>
       sep_stages_bis;
@@ -218,7 +220,8 @@ Pipeline
   saved_firsts_tasks_id(sep_stages.size()),
   saved_lasts_tasks_id(sep_stages.size()),
   bound_adaptors(false),
-  auto_stop(true)
+  auto_stop(true),
+  rt_stats(false)
 {
     this->init<runtime::Task>(firsts,
 	                          lasts,
@@ -246,7 +249,8 @@ Pipeline
   saved_firsts_tasks_id(sep_stages.size()),
   saved_lasts_tasks_id(sep_stages.size()),
   bound_adaptors(false),
-  auto_stop(true)
+  auto_stop(true),
+  rt_stats(false)
 {
     std::vector<std::tuple<std::vector<runtime::Task*>, std::vector<runtime::Task*>, std::vector<runtime::Task*>>>
       sep_stages_bis;
@@ -360,6 +364,15 @@ std::vector<Sequence*>
 Pipeline::get_stages()
 {
     std::vector<Sequence*> stages;
+    for (auto& stage : this->stages)
+        stages.push_back(stage.get());
+    return stages;
+}
+
+std::vector<const Sequence*>
+Pipeline::get_stages() const
+{
+    std::vector<const Sequence*> stages;
     for (auto& stage : this->stages)
         stages.push_back(stage.get());
     return stages;
@@ -562,6 +575,12 @@ void Pipeline
             throw tools::control_flow_error(__FILE__, __LINE__, __func__, message.str());
         }
         this->stages[s]->is_part_of_pipeline = true;
+    }
+
+    if (!this->stages.empty())
+    {
+        this->stages.front()->is_first_pipeline_stage = true;
+        this->stages.back()->is_last_pipeline_stage = true;
     }
 
     // verify that the sequential sequence is equivalent to the pipeline sequence
@@ -1275,6 +1294,14 @@ Pipeline::exec(const std::vector<std::function<bool(const std::vector<const int*
             }
     };
 
+    uint64_t t_start_tsc = 0;
+    std::chrono::steady_clock::time_point t_start_clock;
+    if (this->rt_stats)
+    {
+        t_start_clock = std::chrono::steady_clock::now();
+        t_start_tsc = tools::read_tsc();
+    }
+
     this->thread_pool->run(func_exec, true);
     stages[stages.size() - 1]->exec(stop_conditions[stop_conditions.size() - 1]);
 
@@ -1284,6 +1311,22 @@ Pipeline::exec(const std::vector<std::function<bool(const std::vector<const int*
             m->cancel_waiting();
 
     this->thread_pool->wait();
+
+    if (this->rt_stats)
+    {
+        const uint64_t t_stop_tsc = tools::read_tsc();
+        const auto t_stop_clock = std::chrono::steady_clock::now();
+        const uint64_t dt_ticks = t_stop_tsc - t_start_tsc;
+        const double dt_ns =
+          (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t_stop_clock - t_start_clock).count();
+        if (dt_ticks > 0 && dt_ns > 0.0)
+        {
+            const double ns_per_tick = dt_ns / (double)dt_ticks;
+            for (auto& stage : this->stages)
+                stage->rt_ns_per_tick = ns_per_tick;
+        }
+    }
+
     this->thread_pool->unset_func_exec();
     // ----------------------------------------------------------------------------------------------------------------
 
@@ -1349,6 +1392,14 @@ Pipeline::exec(const std::vector<std::function<bool()>>& stop_conditions)
             }
     };
 
+    uint64_t t_start_tsc = 0;
+    std::chrono::steady_clock::time_point t_start_clock;
+    if (this->rt_stats)
+    {
+        t_start_clock = std::chrono::steady_clock::now();
+        t_start_tsc = tools::read_tsc();
+    }
+
     this->thread_pool->run(func_exec, true);
     stages[stages.size() - 1]->exec(stop_conditions[stop_conditions.size() - 1]);
 
@@ -1358,6 +1409,22 @@ Pipeline::exec(const std::vector<std::function<bool()>>& stop_conditions)
             m->cancel_waiting();
 
     this->thread_pool->wait();
+
+    if (this->rt_stats)
+    {
+        const uint64_t t_stop_tsc = tools::read_tsc();
+        const auto t_stop_clock = std::chrono::steady_clock::now();
+        const uint64_t dt_ticks = t_stop_tsc - t_start_tsc;
+        const double dt_ns =
+          (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t_stop_clock - t_start_clock).count();
+        if (dt_ticks > 0 && dt_ns > 0.0)
+        {
+            const double ns_per_tick = dt_ns / (double)dt_ticks;
+            for (auto& stage : this->stages)
+                stage->rt_ns_per_tick = ns_per_tick;
+        }
+    }
+
     this->thread_pool->unset_func_exec();
     // ----------------------------------------------------------------------------------------------------------------
 
@@ -1575,6 +1642,59 @@ bool
 Pipeline::is_auto_stop() const
 {
     return this->auto_stop;
+}
+
+void
+Pipeline::set_rt_stats(const bool rt_stats, const size_t n_skip_frames)
+{
+    this->rt_stats = rt_stats;
+    for (auto& stage : this->stages)
+        stage->set_rt_stats(rt_stats, n_skip_frames);
+
+    for (size_t sta = 0; sta < this->adaptors.size(); sta++)
+    {
+        auto& stage_push = *this->stages[sta];
+        const auto n_threads_push = stage_push.get_n_threads();
+        for (size_t t = 0; t < n_threads_push; t++)
+        {
+            module::Adaptor_m_to_n* cur_adp = this->adaptors[sta].first[t].get();
+            if (rt_stats)
+                cur_adp->set_push_rt_stats_ptrs(&stage_push.cur_frame_birth_ts[t], &stage_push.cur_stage_start_ts[t]);
+            else
+                cur_adp->set_push_rt_stats_ptrs(nullptr, nullptr);
+        }
+
+        auto& stage_pull = *this->stages[sta + 1];
+        const auto n_threads_pull = stage_pull.get_n_threads();
+        for (size_t t = 0; t < n_threads_pull; t++)
+        {
+            module::Adaptor_m_to_n* cur_adp =
+              (t > 0) ? this->adaptors[sta].second[t - 1].get() : this->adaptors[sta].first[0].get();
+            if (rt_stats)
+                cur_adp->set_pull_rt_stats_ptrs(&stage_pull.cur_frame_birth_ts[t], &stage_pull.cur_stage_start_ts[t]);
+            else
+                cur_adp->set_pull_rt_stats_ptrs(nullptr, nullptr);
+        }
+    }
+}
+
+bool
+Pipeline::is_rt_stats() const
+{
+    return this->rt_stats;
+}
+
+size_t
+Pipeline::get_rt_stats_skip_frames() const
+{
+    return this->stages.empty() ? 0 : this->stages[0]->get_rt_stats_skip_frames();
+}
+
+void
+Pipeline::reset_rt_stats()
+{
+    for (auto& stage : this->stages)
+        stage->reset_rt_stats();
 }
 
 size_t

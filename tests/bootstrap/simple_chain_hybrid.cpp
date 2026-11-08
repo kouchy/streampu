@@ -23,6 +23,7 @@ main(int argc, char** argv)
                           { "dot-filepath", required_argument, NULL, 'o' },
                           { "copy-mode", no_argument, NULL, 'c' },
                           { "print-stats", no_argument, NULL, 'p' },
+                          { "rt-stats", no_argument, NULL, 'r' },
                           { "step-by-step", no_argument, NULL, 'b' },
                           { "debug", no_argument, NULL, 'g' },
                           { "verbose", no_argument, NULL, 'v' },
@@ -38,6 +39,7 @@ main(int argc, char** argv)
     std::string dot_filepath;
     bool no_copy_mode = true;
     bool print_stats = false;
+    bool rt_stats = false;
     bool step_by_step = false;
     bool debug = false;
     bool verbose = false;
@@ -45,7 +47,7 @@ main(int argc, char** argv)
 
     while (1)
     {
-        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:cpbgvkh", longopts, 0);
+        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:cprbgvkh", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -72,6 +74,9 @@ main(int argc, char** argv)
                 break;
             case 'p':
                 print_stats = true;
+                break;
+            case 'r':
+                rt_stats = true;
                 break;
             case 'b':
                 step_by_step = true;
@@ -115,6 +120,9 @@ main(int argc, char** argv)
                 std::cout << "  -p, --print-stats     "
                           << "Enable to print per task statistics (performance will be reduced)     "
                           << "[" << (print_stats ? "true" : "false") << "]" << std::endl;
+                std::cout << "  -r, --rt-stats        "
+                          << "Enable Real-Time sequence latency/jitter/throughput statistics        "
+                          << "[" << (rt_stats ? "true" : "false") << "]" << std::endl;
                 std::cout << "  -g, --debug           "
                           << "Enable task debug mode (print socket data)                            "
                           << "[" << (debug ? "true" : "false") << "]" << std::endl;
@@ -148,6 +156,7 @@ main(int argc, char** argv)
     std::cout << "#   - dot_filepath   = " << (dot_filepath.empty() ? "[empty]" : dot_filepath.c_str()) << std::endl;
     std::cout << "#   - no_copy_mode   = " << (no_copy_mode ? "true" : "false") << std::endl;
     std::cout << "#   - print_stats    = " << (print_stats ? "true" : "false") << std::endl;
+    std::cout << "#   - rt_stats       = " << (rt_stats ? "true" : "false") << std::endl;
     std::cout << "#   - step_by_step   = " << (step_by_step ? "true" : "false") << std::endl;
     std::cout << "#   - debug          = " << (debug ? "true" : "false") << std::endl;
     std::cout << "#   - verbose        = " << (verbose ? "true" : "false") << std::endl;
@@ -194,6 +203,7 @@ main(int argc, char** argv)
     runtime::Sequence sequence_chain(initializer("initialize"), n_threads);
     sequence_chain.set_n_frames(n_inter_frames);
     sequence_chain.set_no_copy_mode(no_copy_mode);
+    sequence_chain.set_rt_stats(rt_stats);
 
     auto tid = 0;
     for (auto cur_initializer : sequence_chain.get_cloned_modules<module::Initializer<uint8_t>>(initializer))
@@ -317,6 +327,11 @@ main(int argc, char** argv)
     {
         std::cout << "#" << std::endl;
         tools::Stats::show(sequence_chain.get_modules_per_types(), true, false);
+    }
+    if (rt_stats)
+    {
+        std::cout << "#" << std::endl;
+        tools::Stats::show_rt(sequence_chain, true);
     }
 
     // sockets unbinding

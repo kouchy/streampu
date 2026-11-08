@@ -55,6 +55,8 @@ main(int argc, char** argv)
                           { "out-filepath", required_argument, NULL, 'j' },
                           { "copy-mode", no_argument, NULL, 'c' },
                           { "print-stats", no_argument, NULL, 'p' },
+                          { "rt-stats", no_argument, NULL, 'r' },
+                          { "rt-skip", required_argument, NULL, 'R' },
                           { "step-by-step", no_argument, NULL, 'b' },
                           { "debug", no_argument, NULL, 'g' },
                           { "force-sequence", no_argument, NULL, 'q' },
@@ -74,11 +76,13 @@ main(int argc, char** argv)
     size_t data_length = 2048;
     size_t n_exec = 100;
     size_t buffer_size = 16;
+    size_t rt_skip = 0;
     std::string dot_filepath;
     std::string in_filepath;
     std::string out_filepath = "file_julia.out";
     bool no_copy_mode = true;
     bool print_stats = false;
+    bool rt_stats = false;
     bool step_by_step = false;
     bool debug = false;
     bool force_sequence = false;
@@ -92,7 +96,7 @@ main(int argc, char** argv)
 
     while (1)
     {
-        const int opt = getopt_long(argc, argv, "t:f:s:d:e:u:o:i:j:cpbgqwkJEHGWh", longopts, 0);
+        const int opt = getopt_long(argc, argv, "t:f:s:d:e:u:o:i:j:R:cprbgqwkJEHGWh", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -128,6 +132,12 @@ main(int argc, char** argv)
                 break;
             case 'p':
                 print_stats = true;
+                break;
+            case 'r':
+                rt_stats = true;
+                break;
+            case 'R':
+                rt_skip = atoi(optarg);
                 break;
             case 'b':
                 step_by_step = true;
@@ -198,6 +208,9 @@ main(int argc, char** argv)
                 std::cout << "  -p, --print-stats     "
                           << "Enable to print per task statistics (performance will be reduced)     "
                           << "[" << (print_stats ? "true" : "false") << "]" << std::endl;
+                std::cout << "  -r, --rt-stats        "
+                          << "Enable Real-Time pipeline latency/jitter/throughput statistics        "
+                          << "[" << (rt_stats ? "true" : "false") << "]" << std::endl;
                 std::cout << "  -g, --debug           "
                           << "Enable task debug mode (print socket data)                            "
                           << "[" << (debug ? "true" : "false") << "]" << std::endl;
@@ -252,6 +265,7 @@ main(int argc, char** argv)
     std::cout << "#   - out_filepath   = " << (out_filepath.empty() ? "[empty]" : out_filepath.c_str()) << std::endl;
     std::cout << "#   - no_copy_mode   = " << (no_copy_mode ? "true" : "false") << std::endl;
     std::cout << "#   - print_stats    = " << (print_stats ? "true" : "false") << std::endl;
+    std::cout << "#   - rt_stats       = " << (rt_stats ? "true" : "false") << std::endl;
     std::cout << "#   - step_by_step   = " << (step_by_step ? "true" : "false") << std::endl;
     std::cout << "#   - debug          = " << (debug ? "true" : "false") << std::endl;
     std::cout << "#   - force_sequence = " << (force_sequence ? "true" : "false") << std::endl;
@@ -395,6 +409,7 @@ main(int argc, char** argv)
                         tsk->reset();
             }
 
+            sequence_chain->set_rt_stats(rt_stats, rt_skip);
             auto t_start = std::chrono::steady_clock::now();
             if (!step_by_step)
                 sequence_chain->exec();
@@ -474,6 +489,7 @@ main(int argc, char** argv)
                         tsk->reset();
             }
 
+            pipeline_chain->set_rt_stats(rt_stats, rt_skip);
             auto t_start = std::chrono::steady_clock::now();
             pipeline_chain->exec();
             std::chrono::nanoseconds duration = std::chrono::steady_clock::now() - t_start;
@@ -512,6 +528,14 @@ main(int argc, char** argv)
                     tools::Stats::show(stages[s]->get_tasks_per_types(), true, false);
                 }
             }
+        }
+        if (rt_stats)
+        {
+            std::cout << "#" << std::endl;
+            if (force_sequence)
+                tools::Stats::show_rt(*sequence_chain, true);
+            else
+                tools::Stats::show_rt(*pipeline_chain, true);
         }
 
         if (force_sequence)
@@ -688,6 +712,7 @@ main(int argc, char** argv)
                     tsk->reset();
         }
 
+        sequence_chain->set_rt_stats(rt_stats, rt_skip);
         std::atomic<unsigned int> counter(0);
         auto t_start = std::chrono::steady_clock::now();
         if (!step_by_step)
@@ -782,6 +807,7 @@ main(int argc, char** argv)
                     tsk->reset();
         }
 
+        pipeline_chain->set_rt_stats(rt_stats, rt_skip);
         std::atomic<unsigned int> counter(0);
         auto t_start = std::chrono::steady_clock::now();
         pipeline_chain->exec([&counter, n_exec]() { return ++counter >= n_exec; });
@@ -838,6 +864,14 @@ main(int argc, char** argv)
                 tools::Stats::show(stages[s]->get_tasks_per_types(), true, false);
             }
         }
+    }
+    if (rt_stats)
+    {
+        std::cout << "#" << std::endl;
+        if (force_sequence)
+            tools::Stats::show_rt(*sequence_chain, true);
+        else
+            tools::Stats::show_rt(*pipeline_chain, true);
     }
 
     if (force_sequence)

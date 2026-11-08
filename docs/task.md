@@ -29,10 +29,24 @@ otherwise this vector is left empty.
 
 ```cpp
 std::function<int(module::Module &m, runtime::Task& t, const size_t frame_id)> codelet;
+int (*fast_codelet_fn)(module::Module&, runtime::Task&, const size_t, void*);
+void* fast_codelet_data;
 ```
 The function called by `_exec()` method (see below), thus dictating the 
 task's behavior. Usually set in the [module](module.md)'s constructor and should 
-return a `status_t`.
+return a `status_t`. To avoid `std::function` type-erasure and heap-indirection
+overhead on the hot path, `Task::register_codelet()` automatically stores a raw
+C-function pointer in `fast_codelet_fn` (and an optional context pointer in
+`fast_codelet_data`) when the codelet is a stateless callable or an internal
+`Module_Julia` trampoline, falling back to `codelet` only for stateful
+user-provided lambdas.
+
+```cpp
+int* status_dataptr_ptr;
+```
+Direct pointer to the raw `int` array inside the output `status` socket's buffer,
+cached once when the `status` socket is created or bound so `Task::_exec()` can
+write per-frame status codes without extra pointer indirections.
 
 ```cpp
 std::shared_ptr<runtime::Socket> fake_input_sockets;

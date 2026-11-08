@@ -274,6 +274,8 @@ support `-J` (`--jl-safe`) to test safe exception wrapping and `-E`
       -c, --copy-mode       Enable to copy data in sequence (performance will be reduced)         [false]
       -b, --step-by-step    Enable step-by-step sequence execution (performance will be reduced)  [false]
       -p, --print-stats     Enable to print per task statistics (performance will be reduced)     [false]
+      -r, --rt-stats        Enable real-time sequence latency & jitter statistics                 [false]
+      -R, --rt-skip         Number of initial frames per thread to skip in RT statistics          [0]
       -J, --jl-safe         Enable Julia safe mode (throw exceptions to C++)                      [false]
       -E, --jl-extern       Evaluate the Julia code from an external file                         [false]
       -g, --debug           Enable task debug mode (print socket data)                            [false]
@@ -310,6 +312,8 @@ support `-J` (`--jl-safe`) to test safe exception wrapping and `-E`
       -c, --copy-mode       Enable to copy data in sequence (performance will be reduced)         [false]
       -b, --step-by-step    Enable step-by-step sequence execution (performance will be reduced)  [false]
       -p, --print-stats     Enable to print per task statistics (performance will be reduced)     [false]
+      -r, --rt-stats        Enable real-time sequence latency & jitter statistics                 [false]
+      -R, --rt-skip         Number of initial frames per thread to skip in RT statistics          [0]
       -J, --jl-safe         Enable Julia safe mode (throw exceptions to C++)                      [false]
       -E, --jl-extern       Evaluate the Julia code from an external file                         [false]
       -g, --debug           Enable task debug mode (print socket data)                            [false]
@@ -473,5 +477,24 @@ usage: ./bin/test-simple-pipeline-julia [options]
   -H, --hybrid          Mix C++ Incrementer and Julia Stateless_Julia stages                  [false]
   -G, --gc-stress       Allocate temporary Julia arrays to stress-test multi-stage GC         [false]
   -W, --warmup          Run a 1-stream warmup execution before the main execution             [false]
+  -r, --rt-stats        Enable real-time pipeline latency & jitter statistics                 [false]
+  -R, --rt-skip         Number of initial frames per thread to skip in RT statistics          [0]
   -h, --help            This help                                                             [false]
+```
+
+---
+
+### Runtime Overhead & Real-Time Jitter Micro-Benchmarks
+
+Two dedicated Julia micro-benchmarks in `tests/julia/` isolate the pure C++-to-Julia codelet invocation overhead (using empty Julia codelets returning `0` immediately) and report Real-Time (RT) frame latency percentiles (`P50` to `P99.99`):
+
+- `./bin/test-sequence-overhead-julia` (`tests/julia/sequence_overhead_julia.cpp`): Compares native C++ `Stateless` (`SFWD` / `SIN+SOUT`) against `Stateless_Julia` (`SFWD`, `SIN+SOUT`, `2xSIN+2xSOUT`, `4xSIN+4xSOUT`, `+Constant`, `safe=false` vs `safe=true`) and `Stateful_Julia` (`1 State + SFWD`), and displays the `Sequence` RT latency table (`tools::Stats::show_rt(seq)`).
+- `./bin/test-pipeline-overhead-julia` (`tests/julia/pipeline_overhead_julia.cpp`): Evaluates a 4-stage `Pipeline` (`Initializer` $\to$ 3 empty `Stateless_Julia` tasks $\to$ 3 empty `Stateless_Julia` or C++ `--hybrid` tasks $\to$ `Finalizer`) and displays both per-stage processing latencies (excluding wait time) and End-to-End (`PIPELINE E2E`) latencies via `tools::Stats::show_rt(pipeline)`.
+
+```bash
+# Sequence C++ vs Julia overhead breakdown + RT stats (skipping 100 warmup frames):
+./bin/test-sequence-overhead-julia -e 100000 -n 64 -k 100
+
+# 4-stage Julia Pipeline RT stats with active waiting (-w) and JIT warmup (-W):
+./bin/test-pipeline-overhead-julia -t 1 -e 50000 -u 16 -w -W -k 100
 ```

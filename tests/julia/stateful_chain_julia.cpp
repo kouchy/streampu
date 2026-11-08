@@ -27,6 +27,7 @@ main(int argc, char** argv)
                           { "dot-filepath", required_argument, NULL, 'o' },
                           { "copy-mode", no_argument, NULL, 'c' },
                           { "print-stats", no_argument, NULL, 'p' },
+                          { "rt-stats", no_argument, NULL, 'r' },
                           { "step-by-step", no_argument, NULL, 'b' },
                           { "jl-safe", no_argument, NULL, 'J' },
                           { "jl-extern", no_argument, NULL, 'E' },
@@ -43,6 +44,7 @@ main(int argc, char** argv)
     std::string dot_filepath;
     bool no_copy_mode = true;
     bool print_stats = false;
+    bool rt_stats = false;
     bool step_by_step = false;
     bool debug = false;
     bool verbose = false;
@@ -51,7 +53,7 @@ main(int argc, char** argv)
 
     while (1)
     {
-        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:cpbgvhJE", longopts, 0);
+        const int opt = getopt_long(argc, argv, "t:f:s:d:e:o:cprbgvhJE", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -78,6 +80,9 @@ main(int argc, char** argv)
                 break;
             case 'p':
                 print_stats = true;
+                break;
+            case 'r':
+                rt_stats = true;
                 break;
             case 'b':
                 step_by_step = true;
@@ -124,6 +129,9 @@ main(int argc, char** argv)
                 std::cout << "  -p, --print-stats     "
                           << "Enable to print per task statistics (performance will be reduced)     "
                           << "[" << (print_stats ? "true" : "false") << "]" << std::endl;
+                std::cout << "  -r, --rt-stats        "
+                          << "Enable Real-Time sequence latency/jitter/throughput statistics        "
+                          << "[" << (rt_stats ? "true" : "false") << "]" << std::endl;
                 std::cout << "  -J, --jl-safe         "
                           << "Enable Julia safe mode (throw exceptions to C++)                      "
                           << "[" << (jl_safe ? "true" : "false") << "]" << std::endl;
@@ -160,6 +168,7 @@ main(int argc, char** argv)
     std::cout << "#   - dot_filepath   = " << (dot_filepath.empty() ? "[empty]" : dot_filepath.c_str()) << std::endl;
     std::cout << "#   - no_copy_mode   = " << (no_copy_mode ? "true" : "false") << std::endl;
     std::cout << "#   - print_stats    = " << (print_stats ? "true" : "false") << std::endl;
+    std::cout << "#   - rt_stats       = " << (rt_stats ? "true" : "false") << std::endl;
     std::cout << "#   - step_by_step   = " << (step_by_step ? "true" : "false") << std::endl;
     std::cout << "#   - jl_safe        = " << (jl_safe ? "true" : "false") << std::endl;
     std::cout << "#   - jl_extern      = " << (jl_extern ? "true" : "false") << std::endl;
@@ -318,6 +327,7 @@ main(int argc, char** argv)
     std::chrono::nanoseconds duration_warmup = std::chrono::steady_clock::now() - t_start_warmup;
     auto elapsed_time_warmup = duration_warmup.count() / 1000.f / 1000.f;
     std::cout << "# Julia warmup (= JIT compilation) time: " << elapsed_time_warmup << " ms" << std::endl;
+    sequence_chain.set_rt_stats(rt_stats);
 
     auto tid = 0;
     for (auto cur_initializer : sequence_chain.get_cloned_modules<module::Initializer<uint8_t>>(initializer))
@@ -468,6 +478,11 @@ main(int argc, char** argv)
     {
         std::cout << "#" << std::endl;
         tools::Stats::show(sequence_chain.get_modules_per_types(), true, false);
+    }
+    if (rt_stats)
+    {
+        std::cout << "#" << std::endl;
+        tools::Stats::show_rt(sequence_chain, true);
     }
 
     // sockets unbinding

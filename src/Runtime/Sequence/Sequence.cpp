@@ -57,6 +57,17 @@ Sequence::Sequence(const std::vector<const runtime::Task*>& firsts,
   , cur_task_id(n_threads, 0)
   , cur_ss(n_threads, nullptr)
   , memory_allocation(memory_allocation)
+  , rt_stats(false)
+  , rt_stats_skip_frames(0)
+  , is_first_pipeline_stage(false)
+  , is_last_pipeline_stage(false)
+  , rt_ns_per_tick(1.0)
+  , rt_stats_skipped_per_thread(n_threads, 0)
+  , rt_stats_per_thread(n_threads)
+  , pipeline_e2e_rt_stats_per_thread(n_threads)
+  , pipeline_inter_rt_stats_per_thread(n_threads)
+  , cur_frame_birth_ts(n_threads, 0)
+  , cur_stage_start_ts(n_threads, 0)
 {
 #ifndef SPU_HWLOC
     if (thread_pinning)
@@ -151,6 +162,17 @@ Sequence::Sequence(const std::vector<runtime::Task*>& firsts,
   , cur_task_id(n_threads, 0)
   , cur_ss(n_threads, nullptr)
   , memory_allocation(memory_allocation)
+  , rt_stats(false)
+  , rt_stats_skip_frames(0)
+  , is_first_pipeline_stage(false)
+  , is_last_pipeline_stage(false)
+  , rt_ns_per_tick(1.0)
+  , rt_stats_skipped_per_thread(n_threads, 0)
+  , rt_stats_per_thread(n_threads)
+  , pipeline_e2e_rt_stats_per_thread(n_threads)
+  , pipeline_inter_rt_stats_per_thread(n_threads)
+  , cur_frame_birth_ts(n_threads, 0)
+  , cur_stage_start_ts(n_threads, 0)
 {
     if (thread_pinning && puids.size() < n_threads)
     {
@@ -245,6 +267,17 @@ Sequence::Sequence(const std::vector<const runtime::Task*>& firsts,
   , cur_task_id(n_threads, 0)
   , cur_ss(n_threads, nullptr)
   , memory_allocation(memory_allocation)
+  , rt_stats(false)
+  , rt_stats_skip_frames(0)
+  , is_first_pipeline_stage(false)
+  , is_last_pipeline_stage(false)
+  , rt_ns_per_tick(1.0)
+  , rt_stats_skipped_per_thread(n_threads, 0)
+  , rt_stats_per_thread(n_threads)
+  , pipeline_e2e_rt_stats_per_thread(n_threads)
+  , pipeline_inter_rt_stats_per_thread(n_threads)
+  , cur_frame_birth_ts(n_threads, 0)
+  , cur_stage_start_ts(n_threads, 0)
 {
 #ifndef SPU_HWLOC
     if (thread_pinning)
@@ -333,6 +366,17 @@ Sequence::Sequence(const std::vector<runtime::Task*>& firsts,
   , cur_task_id(n_threads, 0)
   , cur_ss(n_threads, nullptr)
   , memory_allocation(memory_allocation)
+  , rt_stats(false)
+  , rt_stats_skip_frames(0)
+  , is_first_pipeline_stage(false)
+  , is_last_pipeline_stage(false)
+  , rt_ns_per_tick(1.0)
+  , rt_stats_skipped_per_thread(n_threads, 0)
+  , rt_stats_per_thread(n_threads)
+  , pipeline_e2e_rt_stats_per_thread(n_threads)
+  , pipeline_inter_rt_stats_per_thread(n_threads)
+  , cur_frame_birth_ts(n_threads, 0)
+  , cur_stage_start_ts(n_threads, 0)
 {
     if (thread_pinning && !sequence_pinning_policy.empty())
     {
@@ -970,23 +1014,76 @@ Sequence::_exec(const size_t tid,
     {
         auto& swi_reset = this->switchers_reset[tid];
         std::atomic<bool>* exit_loop_ptr = this->force_exit_loop.get();
-        do
+        if (!this->rt_stats)
         {
-            // force switchers reset to reinitialize the path to the last input socket
-            for (size_t s = 0; s < swi_reset.size(); s++)
-                swi_reset[s]->reset();
+            do
+            {
+                // force switchers reset to reinitialize the path to the last input socket
+                for (size_t s = 0; s < swi_reset.size(); s++)
+                    swi_reset[s]->reset();
 
-            std::fill(statuses.begin(), statuses.end(), nullptr);
-            try
+                std::fill(statuses.begin(), statuses.end(), nullptr);
+                try
+                {
+                    exec_subsequence(sequence, statuses);
+                }
+                catch (tools::processing_aborted const&)
+                {
+                    // do nothing, this is normal
+                }
+            } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition(statuses) &&
+                     !tools::Signal_handler::is_sigint());
+        }
+        else
+        {
+            auto& stage_stats = this->rt_stats_per_thread[tid];
+            auto& e2e_stats = this->pipeline_e2e_rt_stats_per_thread[tid];
+            auto& inter_stats = this->pipeline_inter_rt_stats_per_thread[tid];
+            size_t& skipped = this->rt_stats_skipped_per_thread[tid];
+            const size_t n_skip = this->rt_stats_skip_frames;
+            uint64_t& birth_ts = this->cur_frame_birth_ts[tid];
+            uint64_t& stage_start_ts = this->cur_stage_start_ts[tid];
+            const bool set_birth = (!this->is_part_of_pipeline || this->is_first_pipeline_stage);
+            const bool record_e2e = this->is_last_pipeline_stage;
+            do
             {
-                exec_subsequence(sequence, statuses);
-            }
-            catch (tools::processing_aborted const&)
-            {
-                // do nothing, this is normal
-            }
-        } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition(statuses) &&
-                 !tools::Signal_handler::is_sigint());
+                // force switchers reset to reinitialize the path to the last input socket
+                for (size_t s = 0; s < swi_reset.size(); s++)
+                    swi_reset[s]->reset();
+
+                std::fill(statuses.begin(), statuses.end(), nullptr);
+                const uint64_t t0 = tools::read_tsc();
+                stage_start_ts = t0;
+                if (set_birth) birth_ts = t0;
+                bool aborted = false;
+                try
+                {
+                    exec_subsequence(sequence, statuses);
+                }
+                catch (tools::processing_aborted const&)
+                {
+                    aborted = true;
+                }
+                if (!aborted)
+                {
+                    const uint64_t t1 = tools::read_tsc();
+                    if (skipped < n_skip)
+                    {
+                        skipped++;
+                    }
+                    else
+                    {
+                        stage_stats.add_sample(t1 - stage_start_ts);
+                        if (record_e2e && birth_ts != 0)
+                        {
+                            e2e_stats.add_sample(t1 - birth_ts);
+                            inter_stats.add_sample(t1 - t0);
+                        }
+                    }
+                }
+            } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition(statuses) &&
+                     !tools::Signal_handler::is_sigint());
+        }
 
         if (tools::Signal_handler::is_sigint())
             for (auto& m : this->get_modules<tools::Interface_waiting>())
@@ -1054,22 +1151,74 @@ Sequence::_exec_without_statuses(const size_t tid,
     {
         auto& swi_reset = this->switchers_reset[tid];
         std::atomic<bool>* exit_loop_ptr = this->force_exit_loop.get();
-        do
+        if (!this->rt_stats)
         {
-            // force switchers reset to reinitialize the path to the last input socket
-            for (size_t s = 0; s < swi_reset.size(); s++)
-                swi_reset[s]->reset();
+            do
+            {
+                // force switchers reset to reinitialize the path to the last input socket
+                for (size_t s = 0; s < swi_reset.size(); s++)
+                    swi_reset[s]->reset();
 
-            try
+                try
+                {
+                    exec_subsequence_without_statuses(sequence);
+                }
+                catch (tools::processing_aborted const&)
+                {
+                    // do nothing, this is normal
+                }
+            } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition() &&
+                     !tools::Signal_handler::is_sigint());
+        }
+        else
+        {
+            auto& stage_stats = this->rt_stats_per_thread[tid];
+            auto& e2e_stats = this->pipeline_e2e_rt_stats_per_thread[tid];
+            auto& inter_stats = this->pipeline_inter_rt_stats_per_thread[tid];
+            size_t& skipped = this->rt_stats_skipped_per_thread[tid];
+            const size_t n_skip = this->rt_stats_skip_frames;
+            uint64_t& birth_ts = this->cur_frame_birth_ts[tid];
+            uint64_t& stage_start_ts = this->cur_stage_start_ts[tid];
+            const bool set_birth = (!this->is_part_of_pipeline || this->is_first_pipeline_stage);
+            const bool record_e2e = this->is_last_pipeline_stage;
+            do
             {
-                exec_subsequence_without_statuses(sequence);
-            }
-            catch (tools::processing_aborted const&)
-            {
-                // do nothing, this is normal
-            }
-        } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition() &&
-                 !tools::Signal_handler::is_sigint());
+                // force switchers reset to reinitialize the path to the last input socket
+                for (size_t s = 0; s < swi_reset.size(); s++)
+                    swi_reset[s]->reset();
+
+                const uint64_t t0 = tools::read_tsc();
+                stage_start_ts = t0;
+                if (set_birth) birth_ts = t0;
+                bool aborted = false;
+                try
+                {
+                    exec_subsequence_without_statuses(sequence);
+                }
+                catch (tools::processing_aborted const&)
+                {
+                    aborted = true;
+                }
+                if (!aborted)
+                {
+                    const uint64_t t1 = tools::read_tsc();
+                    if (skipped < n_skip)
+                    {
+                        skipped++;
+                    }
+                    else
+                    {
+                        stage_stats.add_sample(t1 - stage_start_ts);
+                        if (record_e2e && birth_ts != 0)
+                        {
+                            e2e_stats.add_sample(t1 - birth_ts);
+                            inter_stats.add_sample(t1 - t0);
+                        }
+                    }
+                }
+            } while (!exit_loop_ptr->load(std::memory_order_relaxed) && !stop_condition() &&
+                     !tools::Signal_handler::is_sigint());
+        }
 
         if (tools::Signal_handler::is_sigint())
             for (auto& m : this->get_modules<tools::Interface_waiting>())
@@ -1130,9 +1279,27 @@ Sequence::exec(std::function<bool(const std::vector<const int*>&)> stop_conditio
     std::function<void(const size_t)> func_exec = [this, &real_stop_condition](const size_t tid)
     { this->Sequence::_exec(tid + 1, real_stop_condition, this->sequences[tid + 1]); };
 
+    uint64_t t_start_tsc = 0;
+    std::chrono::steady_clock::time_point t_start_clock;
+    if (this->rt_stats && !this->is_part_of_pipeline)
+    {
+        t_start_clock = std::chrono::steady_clock::now();
+        t_start_tsc = tools::read_tsc();
+    }
+
     this->thread_pool->run(func_exec, true);
     this->_exec(0, real_stop_condition, this->sequences[0]);
     this->thread_pool->wait();
+
+    if (this->rt_stats && !this->is_part_of_pipeline)
+    {
+        const uint64_t t_stop_tsc = tools::read_tsc();
+        const auto t_stop_clock = std::chrono::steady_clock::now();
+        const uint64_t dt_ticks = t_stop_tsc - t_start_tsc;
+        const double dt_ns =
+          (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t_stop_clock - t_start_clock).count();
+        if (dt_ticks > 0 && dt_ns > 0.0) this->rt_ns_per_tick = dt_ns / (double)dt_ticks;
+    }
 
     this->thread_pool->unset_func_exec();
 
@@ -1167,9 +1334,27 @@ Sequence::exec(std::function<bool()> stop_condition)
     std::function<void(const size_t)> func_exec = [this, &real_stop_condition](const size_t tid)
     { this->Sequence::_exec_without_statuses(tid + 1, real_stop_condition, this->sequences[tid + 1]); };
 
+    uint64_t t_start_tsc = 0;
+    std::chrono::steady_clock::time_point t_start_clock;
+    if (this->rt_stats && !this->is_part_of_pipeline)
+    {
+        t_start_clock = std::chrono::steady_clock::now();
+        t_start_tsc = tools::read_tsc();
+    }
+
     this->thread_pool->run(func_exec, true);
     this->_exec_without_statuses(0, real_stop_condition, this->sequences[0]);
     this->thread_pool->wait();
+
+    if (this->rt_stats && !this->is_part_of_pipeline)
+    {
+        const uint64_t t_stop_tsc = tools::read_tsc();
+        const auto t_stop_clock = std::chrono::steady_clock::now();
+        const uint64_t dt_ticks = t_stop_tsc - t_start_tsc;
+        const double dt_ns =
+          (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t_stop_clock - t_start_clock).count();
+        if (dt_ticks > 0 && dt_ns > 0.0) this->rt_ns_per_tick = dt_ns / (double)dt_ticks;
+    }
 
     this->thread_pool->unset_func_exec();
 
@@ -2903,4 +3088,61 @@ Sequence::has_julia() const
 #else
     return false;
 #endif /* SPU_JULIA */
+}
+
+void
+Sequence::set_rt_stats(const bool rt_stats, const size_t n_skip_frames)
+{
+    this->rt_stats = rt_stats;
+    this->rt_stats_skip_frames = n_skip_frames;
+}
+
+bool
+Sequence::is_rt_stats() const
+{
+    return this->rt_stats;
+}
+
+size_t
+Sequence::get_rt_stats_skip_frames() const
+{
+    return this->rt_stats_skip_frames;
+}
+
+void
+Sequence::reset_rt_stats()
+{
+    std::fill(this->rt_stats_skipped_per_thread.begin(), this->rt_stats_skipped_per_thread.end(), 0);
+    for (auto& s : this->rt_stats_per_thread)
+        s.reset();
+    for (auto& s : this->pipeline_e2e_rt_stats_per_thread)
+        s.reset();
+    for (auto& s : this->pipeline_inter_rt_stats_per_thread)
+        s.reset();
+    std::fill(this->cur_frame_birth_ts.begin(), this->cur_frame_birth_ts.end(), 0);
+    std::fill(this->cur_stage_start_ts.begin(), this->cur_stage_start_ts.end(), 0);
+}
+
+const std::vector<tools::Rt_stats>&
+Sequence::get_rt_stats_per_thread() const
+{
+    return this->rt_stats_per_thread;
+}
+
+const std::vector<tools::Rt_stats>&
+Sequence::get_pipeline_e2e_rt_stats_per_thread() const
+{
+    return this->pipeline_e2e_rt_stats_per_thread;
+}
+
+const std::vector<tools::Rt_stats>&
+Sequence::get_pipeline_inter_rt_stats_per_thread() const
+{
+    return this->pipeline_inter_rt_stats_per_thread;
+}
+
+double
+Sequence::get_rt_ns_per_tick() const
+{
+    return this->rt_ns_per_tick;
 }

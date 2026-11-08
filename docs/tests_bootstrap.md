@@ -40,6 +40,8 @@ the `Initializer` ($t_1$) "$+6$".
       -c, --copy-mode       Enable to copy data in sequence (performance will be reduced)         [false]
       -b, --step-by-step    Enable step-by-step sequence execution (performance will be reduced)  [false]
       -p, --print-stats     Enable to print per task statistics (performance will be reduced)     [false]
+      -r, --rt-stats        Enable real-time sequence latency & jitter statistics                 [false]
+      -R, --rt-skip         Number of initial frames per thread to skip in RT statistics          [0]
       -g, --debug           Enable task debug mode (print socket data)                            [false]
       -u, --subseq          Enable subsequence in the executed sequence                           [false]
       -v, --verbose         Enable verbose mode                                                   [false]
@@ -73,6 +75,8 @@ the `Initializer` ($t_1$) "$+6$".
       -c, --copy-mode       Enable to copy data in sequence (performance will be reduced)         [true]
       -b, --step-by-step    Enable step-by-step sequence execution (performance will be reduced)  [false]
       -p, --print-stats     Enable to print per task statistics (performance will be reduced)     [false]
+      -r, --rt-stats        Enable real-time sequence latency & jitter statistics                 [false]
+      -R, --rt-skip         Number of initial frames per thread to skip in RT statistics          [0]
       -g, --debug           Enable task debug mode (print socket data)                            [false]
       -u, --subseq          Enable subsequence in the executed sequence                           [false]
       -v, --verbose         Enable verbose mode                                                   [false]
@@ -345,9 +349,28 @@ usage: ./bin/test-simple-pipeline [options]
   -c, --copy-mode       Enable to copy data in sequence (performance will be reduced)         [false]
   -b, --step-by-step    Enable step-by-step sequence execution (performance will be reduced)  [false]
   -p, --print-stats     Enable to print per task statistics (performance will be reduced)     [false]
+  -r, --rt-stats        Enable real-time pipeline latency & jitter statistics                 [false]
+  -R, --rt-skip         Number of initial frames per thread to skip in RT statistics          [0]
   -g, --debug           Enable task debug mode (print socket data)                            [false]
   -q, --force-sequence  Force sequence instead of pipeline                                    [false]
   -w, --active-waiting  Enable active waiting in the pipeline synchronizations                [false]
   -h, --help            This help                                                             [false]
+```
+
+----
+
+## Runtime Overhead Micro-Benchmarks
+
+To quantify the pure scheduling and synchronization overhead of `StreamPU` in nanoseconds and CPU cycles—as well as Real-Time (RT) frame latency percentiles (`P50` to `P99.99`)—two dedicated micro-benchmarks execute chains of **empty no-op tasks** (`__asm__ volatile("" ::: "memory")` barrier preventing compiler dead-code elimination without performing any payload computation):
+
+- `./bin/test-sequence-overhead` (`tests/bootstrap/sequence_overhead.cpp`): Measures per-task dispatch overhead in a `Sequence` across socket types (`SFWD`, `SIN+SOUT`, `2xSIN+2xSOUT`, `4xSIN+4xSOUT`), copy vs. no-copy modes, stateless vs. stateful capturing lambdas, and `Switcher` control-flow (`commute` + `select`), and prints the `Sequence` RT latency table for the 6-task `SFWD` chain.
+- `./bin/test-pipeline-overhead` (`tests/bootstrap/pipeline_overhead.cpp`): Measures a 4-stage `Pipeline` (`Initializer` $\to$ 3 empty `Stateless` tasks $\to$ 3 empty `Stateless` tasks $\to$ `Finalizer`) with `pipeline.set_rt_stats(true, n_skip_frames)` and `tools::Stats::show_rt(pipeline)`.
+
+```bash
+# Sequence overhead breakdown + RT stats skipping the first 100 warmup frames:
+./bin/test-sequence-overhead -e 500000 -n 64 -k 100
+
+# 4-stage Pipeline RT stats with active waiting (-w) skipping the first 100 warmup frames:
+./bin/test-pipeline-overhead -t 1 -e 100000 -u 16 -w -k 100
 ```
 

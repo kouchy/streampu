@@ -68,6 +68,16 @@ class Adaptor_m_to_n
     size_t cur_push_id;
     size_t cur_pull_id;
 
+    // Shared ring buffer of frame birth timestamps (`[queue_id][slot_id]`) and per-thread pointers used when
+    // `Pipeline::set_rt_stats(true)` is enabled. Piggybacks on the existing lock-free `first`/`last`/`counter`
+    // ring buffer synchronization to track true end-to-end frame latency across pipeline stages without adding
+    // dummy tasks or locks.
+    std::shared_ptr<std::vector<std::vector<uint64_t>>> ts_buffer;
+    uint64_t* push_birth_ts_ptr;
+    uint64_t* push_stage_start_ts_ptr;
+    uint64_t* pull_birth_ts_ptr;
+    uint64_t* pull_stage_start_ts_ptr;
+
   public:
     inline Adaptor_m_to_n(const size_t n_elmts,
                           const std::type_index datatype,
@@ -91,6 +101,17 @@ class Adaptor_m_to_n
     void add_pusher();
     void add_puller();
     void alloc_buffers();
+
+    inline void set_push_rt_stats_ptrs(uint64_t* birth_ts_ptr, uint64_t* stage_start_ts_ptr = nullptr) noexcept
+    {
+        this->push_birth_ts_ptr = birth_ts_ptr;
+        this->push_stage_start_ts_ptr = stage_start_ts_ptr;
+    }
+    inline void set_pull_rt_stats_ptrs(uint64_t* birth_ts_ptr, uint64_t* stage_start_ts_ptr) noexcept
+    {
+        this->pull_birth_ts_ptr = birth_ts_ptr;
+        this->pull_stage_start_ts_ptr = stage_start_ts_ptr;
+    }
 
   protected:
     void send_cancel_signal();

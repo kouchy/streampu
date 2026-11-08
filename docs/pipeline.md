@@ -172,3 +172,33 @@ The puller can wake up a push task if this one is waiting for an empty buffer.
 void wake_up_puller();
 ```
 The pusher can wake up a pull task if this one is waiting for an empty buffer.
+
+<a name="Pipeline_RT_stats"></a>
+## Real-Time (RT) Latency & Jitter Statistics
+
+`spu::runtime::Pipeline` supports frame-level Real-Time (RT) latency and jitter profiling across multi-threaded stages without adding dummy tasks or per-task clock overhead:
+
+```cpp
+void set_rt_stats(const bool rt_stats, const size_t n_skip_frames = 0);
+void reset_rt_stats();
+```
+
+When `pipeline.set_rt_stats(true, n_skip_frames)` is called before `pipeline.exec()`:
+
+1. **Per-stage processing latency (excluding wait time)**:
+    - In downstream stages ($s > 0$), `Adaptor_m_to_n::wait_pull()` records `cur_stage_start_ts = tools::read_tsc()` **after** unblocking on the incoming FIFO, so idle waiting for upstream data is excluded.
+    - In upstream stages ($s < N - 1$), if `Adaptor_m_to_n::wait_push()` blocks on a full outgoing FIFO, the blocked duration (`t_wait_end - t_wait_start`) is added to `cur_stage_start_ts`, subtracting backpressure wait time from the stage's pure processing latency.
+2. **End-to-End (`PIPELINE E2E`) frame latency (including wait & FIFO queuing time)**:
+    - Stage 0 stamps `cur_frame_birth_ts` at the start of each frame before executing its first task.
+    - Each `Adaptor_m_to_n` instance owns a lock-free timestamp ring buffer (`ts_buffer`) indexed by the exact same `first`/`last` slot indices as the data ring buffer (`buffer`).
+    - Regardless of whether the adaptor operates in `copy` or `no_copy` mode, `wake_up_puller()` writes `frame_birth_ts` into `ts_buffer[cur_push_id][last]` before decrementing the atomic slot counter, and `wait_pull()` reads `frame_birth_ts` from `ts_buffer[cur_pull_id][first]` before releasing the slot.
+    - When the final stage finishes its last task for a frame, it records `t_end - cur_frame_birth_ts` into `pipeline_e2e_rt_stats_per_thread`, capturing the true end-to-end traversal latency of the frame through all stages and inter-stage FIFOs.
+3. **Warmup frame skipping (`n_skip_frames`)**: Passing `n_skip_frames > 0` discards the first `n_skip_frames` executions per thread in each stage before accumulating statistics.
+
+Display both the per-stage processing table and the End-to-End (`PIPELINE E2E`) summary table with:
+
+```cpp
+pipeline.set_rt_stats(true, /*n_skip_frames=*/100);
+pipeline.exec();
+tools::Stats::show_rt(pipeline);
+```

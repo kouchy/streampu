@@ -144,9 +144,15 @@ execution.
 
 ```cpp
 std::vector<std::function<const int*()>> processes;
+std::vector<runtime::Task*> tasks_ptr;
+std::vector<runtime::Custom_process_info> custom_processes;
 ```
-Whenever `_exec()` reaches a new sub-sequence it executes every function
-contained in this list, there is one for each task in the sub-sequence. Refer to
+Whenever `_exec()` reaches a new sub-sequence it executes each task contained in
+this sub-sequence. Standard tasks are invoked directly through `tasks_ptr[i]->exec()`
+without `std::function` indirection, while special runtime tasks (`push`, `pull`,
+`commute`, `select` in no-copy mode) store their socket rebinding metadata in a
+compact POD descriptor (`Custom_process_info` in `custom_processes`) and are
+executed via a direct C function pointer (`fn(custom_processes[i])`). Refer to
 `gen_processes()` to understand how they are created and what they contain.
 
 ```cpp
@@ -185,3 +191,27 @@ The nodes pointing to this node and the ones it points to respectively.
 T* contents; /*!< Pointer to the node contents, could be anything. */
 ```
 The contents of the node, usually a [sub-sequence](#Sub-sequence).
+
+<a name="RT_stats"></a>
+## Real-Time (RT) Latency & Jitter Statistics
+
+While per-task statistics (`task.set_stats(true)`) wrap every individual task execution in a `std::chrono::steady_clock::now()` call—which adds tens of nanoseconds of measurement perturbation per task—`Sequence` also provides a **zero-perturbation, frame-level Real-Time (RT) profiler** designed for low-latency and hard/soft real-time systems.
+
+```cpp
+void set_rt_stats(const bool rt_stats, const size_t n_skip_frames = 0);
+void reset_rt_stats();
+```
+
+When `sequence.set_rt_stats(true, n_skip_frames)` is enabled:
+
+1. **Single hardware timestamp per frame**: Only one hardware cycle/timer read (`spu::tools::read_tsc()`: `rdtsc` on x86_64, `cntvct_el0` on AArch64, `rdtime` on RISC-V, or `steady_clock` fallback) is performed at the end of each complete sequence execution (`t_end - t_start`, where `t_end` serves as `t_start` of the next frame). Inside the sequence, tasks execute at native speed with `stats = false`.
+2. **$O(1)$ lock-free HDR histogram (`spu::tools::Rt_stats`)**: Each worker thread records frame durations in a pre-allocated thread-local sub-bucketed logarithmic histogram (1024 bins = 32 power-of-2 buckets $\times$ 32 linear sub-bins, $< 0.8\%$ relative quantization error, zero heap allocation).
+3. **Warmup frame skipping (`n_skip_frames`)**: The optional `n_skip_frames` parameter (default `0`) discards the first `n_skip_frames` executions on each thread before accumulating statistics, filtering out cold-cache misses, OS page faults, CPU frequency scaling (DVFS), or Julia JIT compilation transients.
+
+To display the collected Real-Time latency percentiles (`Min`, `Avg`, `Std`, `P50`, `P90`, `P99`, `P99.9`, `P99.99`, `Max`) and tail throughputs (`Avg`, `1% low`, `0.1% low`, `0.01% low`), call `spu::tools::Stats::show_rt`:
+
+```cpp
+sequence.set_rt_stats(true, /*n_skip_frames=*/100);
+sequence.exec_seq(); // or sequence.exec(...)
+tools::Stats::show_rt(sequence);
+```
