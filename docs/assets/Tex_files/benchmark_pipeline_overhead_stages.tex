@@ -1,0 +1,66 @@
+\documentclass{standalone}
+
+\usepackage{tikz}
+\usetikzlibrary{streampu}
+
+\begin{document}
+  \begin{tikzpicture}[background rectangle/.style={thick, draw=gray!60, fill=white, fill opacity=1.0, rounded corners=2px}, show background rectangle]
+    %%%%%%%%%%%%%%%%%%
+    %% create tasks %%
+    %%%%%%%%%%%%%%%%%%
+    %     options              id   coords  label            sin sout sfwd attributes
+    %     -------              --   ------  -----            --- ---- ---- ----------
+    \task                      {t1} {0,0}   {empty\\($t_1$)}  {0} {1}  {0}  {"seq"};
+    \task [right=1.15cm of t1] {t2} {}      {empty\\($t_2$)}  {0} {0}  {1}  {"seq"};
+    \task [right=1.35cm of t2] {t3} {}      {empty\\($t_3$)}  {0} {0}  {1}  {};
+    \task [right=1.15cm of t3] {t4} {}      {empty\\($t_4$)}  {0} {0}  {1}  {};
+    \task [right=1.35cm of t4] {t5} {}      {empty\\($t_5$)}  {0} {0}  {1}  {"seq"};
+    \task [right=1.15cm of t5] {t6} {}      {empty\\($t_6$)}  {1} {0}  {0}  {"seq"};
+
+    %%%%%%%%%%%%%%%%%%%%
+    %% create modules %%
+    %%%%%%%%%%%%%%%%%%%%
+    %       options task ids id   label
+    %       ------- -------- --   -----
+    \module         {"t1"}   {m1} {Stateless};
+    \module         {"t2"}   {m2} {Stateless};
+    \module         {"t3"}   {m3} {Stateless};
+    \module         {"t4"}   {m4} {Stateless};
+    \module         {"t5"}   {m5} {Stateless};
+    \module         {"t6"}   {m6} {Stateless};
+
+    %%%%%%%%%%%%%%%%
+    %% bind tasks %%
+    %%%%%%%%%%%%%%%%
+    %     options start id path end id
+    %     ------- -------- ---- ------
+    \draw [bind]  (t1_so1) -- (t2_si1);
+    \draw [bind]  (t2_so1) -- (t3_si1);
+    \draw [bind]  (t3_so1) -- (t4_si1);
+    \draw [bind]  (t4_so1) -- (t5_si1);
+    \draw [bind]  (t5_so1) -- (t6_si1);
+
+    %%%%%%%%%%%%%%%%%%%
+    %% create stages %%
+    %%%%%%%%%%%%%%%%%%%
+    %      options                 object ids  id   label      n_threads
+    %      -------                 ----------  --   -----      ---------
+    \stage [minimum height=3.00cm] {"m1","m2"} {s1} {Stage 1 } {1}
+    \stage [minimum height=3.00cm] {"m3","m4"} {s2} {Stage 2 } {4}
+    \stage [minimum height=3.00cm] {"m5","m6"} {s3} {Stage 3 } {1}
+
+    \node[seq, dashdotted, minimum height=4.40cm, inner xsep=0.45cm, Paired-9, label={[Paired-9,align=center]below:3-stage pipeline ($1 \rightarrow N \rightarrow 1$ threads via Adaptor\_m\_to\_n)}, fit=(s1) (s2) (s3)] (pip) {};
+
+    %%%%%%%%%%%%%%%%%%%%%
+    %% clone the tasks %%
+    %%%%%%%%%%%%%%%%%%%%%
+    %      options task ids    n clones
+    %      ------- --------    --------
+    \clone []      {"t3","t4"} {3}
+
+    %%%%%%%%%%%%%%%%%%%%%
+    %% draw the legend %%
+    %%%%%%%%%%%%%%%%%%%%%
+    \legend [shift={(-1.1,2.25)}]
+  \end{tikzpicture}
+\end{document}

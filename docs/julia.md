@@ -486,15 +486,19 @@ usage: ./bin/test-simple-pipeline-julia [options]
 
 ### Runtime Overhead & Real-Time Jitter Micro-Benchmarks
 
-Two dedicated Julia micro-benchmarks in `tests/julia/` isolate the pure C++-to-Julia codelet invocation overhead (using empty Julia codelets returning `0` immediately) and report Real-Time (RT) frame latency percentiles (`P50` to `P99.99`):
+When `StreamPU` is compiled with `-DSPU_LINK_JULIA=ON`, the two unified micro-benchmarks in `tests/benchmarks/` automatically activate the `JL_UNSAFE` (`jl_safe = false`, `@cfunction` fast trampoline) and `JL_SAFE` (`jl_safe = true`, exception-catching trampoline) columns alongside native `CPP`, isolating the pure C++-to-Julia codelet invocation overhead and reporting Real-Time (RT) frame latency percentiles (`P50` to `P99.99` and `MAX`):
 
-- `./bin/test-sequence-overhead-julia` (`tests/julia/sequence_overhead_julia.cpp`): Compares native C++ `Stateless` (`SFWD` / `SIN+SOUT`) against `Stateless_Julia` (`SFWD`, `SIN+SOUT`, `2xSIN+2xSOUT`, `4xSIN+4xSOUT`, `+Constant`, `safe=false` vs `safe=true`) and `Stateful_Julia` (`1 State + SFWD`), and displays the `Sequence` RT latency table (`tools::Stats::show_rt(seq)`).
-- `./bin/test-pipeline-overhead-julia` (`tests/julia/pipeline_overhead_julia.cpp`): Evaluates a 4-stage `Pipeline` (`Initializer` $\to$ 3 empty `Stateless_Julia` tasks $\to$ 3 empty `Stateless_Julia` or C++ `--hybrid` tasks $\to$ `Finalizer`) and displays both per-stage processing latencies (excluding wait time) and End-to-End (`PIPELINE E2E`) latencies via `tools::Stats::show_rt(pipeline)`.
+- `./bin/benchmark-sequence-overhead` (`tests/benchmarks/sequence_overhead.cpp`): Compares `CPP`, `JL_UNSAFE`, and `JL_SAFE` side by side (with 2 rows per case: `ns/stm` and `ns/tsk`), or displays the full HDR RT percentile distribution when a single backend is selected (`-b JL_UNSAFE`).
+- `./bin/benchmark-pipeline-overhead` (`tests/benchmarks/pipeline_overhead.cpp`): Evaluates `CPP`, `JL_UNSAFE`, and `JL_SAFE` multi-stage pipelines (with 2 rows per case: `E2E ns/stm` and `STG ns/tsk`), or displays the full HDR RT percentile distribution when a single backend is selected (`-b JL_UNSAFE`).
+
+See the dedicated [Runtime Overhead Benchmarks](benchmark_overhead.md) page for detailed diagrams and analysis.
 
 ```bash
-# Sequence C++ vs Julia overhead breakdown + RT stats (skipping 100 warmup frames):
-./bin/test-sequence-overhead-julia -e 100000 -n 64 -k 100
+# Multi-backend average comparison (CPP vs JL_UNSAFE vs JL_SAFE):
+./bin/benchmark-sequence-overhead -e 300000 -d 64 -b CPP,JL_UNSAFE,JL_SAFE
+./bin/benchmark-pipeline-overhead -e 50000 -d 64 -b CPP,JL_UNSAFE,JL_SAFE
 
-# 4-stage Julia Pipeline RT stats with active waiting (-w) and JIT warmup (-W):
-./bin/test-pipeline-overhead-julia -t 1 -e 50000 -u 16 -w -W -k 100
+# Single-backend full RT percentiles (STD, P50, P99, P99.9, P99.99, MAX):
+./bin/benchmark-sequence-overhead -e 300000 -d 64 -b JL_UNSAFE
+./bin/benchmark-pipeline-overhead -e 50000 -d 64 -b JL_UNSAFE
 ```

@@ -79,7 +79,9 @@ nav:
       - concepts_overview.md
     - Tests:
       - tests_bootstrap.md
-    - benchmark.md
+    - Benchmarks:
+      - Custom Chain: benchmark.md
+      - Runtime Overhead: benchmark_overhead.md
     - julia.md
     - Runtime:
       - thread_pinning.md

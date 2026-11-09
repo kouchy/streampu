@@ -361,16 +361,18 @@ usage: ./bin/test-simple-pipeline [options]
 
 ## Runtime Overhead Micro-Benchmarks
 
-To quantify the pure scheduling and synchronization overhead of `StreamPU` in nanoseconds and CPU cycles—as well as Real-Time (RT) frame latency percentiles (`P50` to `P99.99`)—two dedicated micro-benchmarks execute chains of **empty no-op tasks** (`__asm__ volatile("" ::: "memory")` barrier preventing compiler dead-code elimination without performing any payload computation):
+To quantify the pure scheduling and synchronization overhead of `StreamPU` in nanoseconds and CPU cycles—as well as Real-Time (RT) frame latency percentiles (`P50` to `P99.99`)—two dedicated polyglot micro-benchmarks in `tests/benchmarks/` execute chains of **empty no-op tasks** (`__asm__ volatile("" ::: "memory")` barrier preventing compiler dead-code elimination without performing any payload computation):
 
-- `./bin/test-sequence-overhead` (`tests/bootstrap/sequence_overhead.cpp`): Measures per-task dispatch overhead in a `Sequence` across socket types (`SFWD`, `SIN+SOUT`, `2xSIN+2xSOUT`, `4xSIN+4xSOUT`), copy vs. no-copy modes, stateless vs. stateful capturing lambdas, and `Switcher` control-flow (`commute` + `select`), and prints the `Sequence` RT latency table for the 6-task `SFWD` chain.
-- `./bin/test-pipeline-overhead` (`tests/bootstrap/pipeline_overhead.cpp`): Measures a 4-stage `Pipeline` (`Initializer` $\to$ 3 empty `Stateless` tasks $\to$ 3 empty `Stateless` tasks $\to$ `Finalizer`) with `pipeline.set_rt_stats(true, n_skip_frames)` and `tools::Stats::show_rt(pipeline)`.
+- `./bin/benchmark-sequence-overhead` (`tests/benchmarks/sequence_overhead.cpp`): Measures per-task dispatch overhead in a `Sequence` across socket types (`0-socket`, `SFWD`, `SIN+SOUT`), socket counts (`1..16`), lambda capture sizes (`fast_codelet_fn` vs `std::function`), execution modes (`fast`, `statuses`, `stats`), chain lengths (`2..128`), multi-wave execution (`n_waves = 1..8`), multi-threading, `Switcher` control flow, and HDR RT latency percentiles (`P50` to `P99.99`). When compiled with `-DSPU_LINK_JULIA=ON`, it automatically compares `CPP`, `JL`, and `JL_SAFE` side by side.
+- `./bin/benchmark-pipeline-overhead` (`tests/benchmarks/pipeline_overhead.cpp`): Measures `Pipeline` and `Adaptor_m_to_n` overhead across active spin-wait vs passive condition variables, FIFO buffer sizes (`1..64`), pipeline depths (`2..8` stages), data-parallel stage multi-threading (`1 -> N -> 1`), zero-copy pointer swapping vs memory copy (`64 B` to `64 KB`), socket counts (`1..8`), and end-to-end HDR latency percentiles.
+
+See the dedicated [Runtime Overhead Benchmarks](benchmark_overhead.md) page for a complete description and architectural breakdown.
 
 ```bash
-# Sequence overhead breakdown + RT stats skipping the first 100 warmup frames:
-./bin/test-sequence-overhead -e 500000 -n 64 -k 100
+# Sequence overhead breakdown + RT stats:
+./bin/benchmark-sequence-overhead -e 300000 -d 64 -r
 
-# 4-stage Pipeline RT stats with active waiting (-w) skipping the first 100 warmup frames:
-./bin/test-pipeline-overhead -t 1 -e 100000 -u 16 -w -k 100
+# Pipeline overhead breakdown + RT stats:
+./bin/benchmark-pipeline-overhead -e 50000 -d 64 -r
 ```
 

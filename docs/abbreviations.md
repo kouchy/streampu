@@ -23,8 +23,10 @@
 *[CSV]: Comma-Separated Values
 *[DFS]: Depth-First Search
 *[DSEL]: Domain-Specific Embedded Language
+*[E2E]: End-to-end
 *[EOF]: End Of File
 *[FER]: Frame Error Rate
+*[FIFO]: First In First Out
 *[GC]: Garbage Collector
 *[GNU]: GNU's Not Unix!
 *[GPP]: General Purpose Processor
@@ -66,6 +68,7 @@
 *[SMT]: Simultaneous MultiThreading (or Hyper-Threading in the Intel nomenclature)
 *[SNRs]: Signal Noise Ratios
 *[SNR]: Signal Noise Ratio
+*[SPSC]: Single-Producer Single-Consumer
 *[SSE]: Streaming SIMD Extensions
 *[SSE2]: Streaming SIMD Extensions 2
 *[SSE3]: Streaming SIMD Extensions 3
@@ -73,4 +76,5 @@
 *[SSE4.1]: Streaming SIMD Extensions 4.1
 *[SSE4.2]: Streaming SIMD Extensions 4.2
 *[STD]: Standard
+*[STG]: Stage (pipeline)
 *[UMA]: Uniform Memory Access

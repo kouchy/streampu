@@ -1,8 +1,8 @@
-# Benchmark Application
+# Custom Chain Benchmark
 
-StreamPU comes with an integrated **benchmark application** that allows to 
+StreamPU comes with an integrated **custom chain benchmark application** (`tests/benchmarks/custom_chain.cpp`) that allows to 
 **build and to execute custom chains directly from the command line interface** 
-(CLI). The `spu-benchmark` can be used to **simulate simple streaming 
+(CLI). The `benchmark-custom-chain` binary can be used to **simulate simple streaming 
 applications** or as a **performance test suite for specific architectures**.
 
 Basically, there are 3 different types of task that can be instantiated:
@@ -145,37 +145,37 @@ Moreover, for each stage it is possible to specify the number of replications
 === "3-stage pipeline with in/out sockets" 
     <figure markdown>
       ![simple pipeline io](./assets/test_generic_pipeline_io.svg){ width="600" }
-      <figcaption>`spu-benchmark`: input/output sockets & 3-stage pipeline.</figcaption>
+      <figcaption>`benchmark-custom-chain`: input/output sockets & 3-stage pipeline.</figcaption>
     </figure>
     ```bash
-    spu-benchmark -e 100 -n "1,3,1" -t "3,1,3" -R "(init,increment,fin)"
+    benchmark-custom-chain -e 100 -n "1,3,1" -t "3,1,3" -R "(init,increment,fin)"
     ```
 
 === "3-stage pipeline with forward sockets"
     <figure markdown>
       ![simple pipeline fwd](./assets/test_generic_pipeline_fwd.svg){ width="600" }
-      <figcaption>`spu-benchmark`: forward sockets & 3-stage pipeline.</figcaption>
+      <figcaption>`benchmark-custom-chain`: forward sockets & 3-stage pipeline.</figcaption>
     </figure>
     ```bash
-    spu-benchmark -i INPUT_FILE -n "1,3,1" -t "1,3,1" -R "(read,relayf,write)"
+    benchmark-custom-chain -i INPUT_FILE -n "1,3,1" -t "1,3,1" -R "(read,relayf,write)"
     ```
 
 === "3-stage pipeline with hybrid sockets"
     <figure markdown>
       ![simple pipeline hybrid](./assets/test_generic_pipeline_hybrid.svg){ width="600" }
-      <figcaption>`spu-benchmark`: hybrid in/out and forward sockets & 3-stage pipeline.</figcaption>
+      <figcaption>`benchmark-custom-chain`: hybrid in/out and forward sockets & 3-stage pipeline.</figcaption>
     </figure>
     ```bash
-    spu-benchmark -i INPUT_FILE -t "1,3,1" -r "((read),(relayf,incrementf,relay),(write))"
+    benchmark-custom-chain -i INPUT_FILE -t "1,3,1" -r "((read),(relayf,incrementf,relay),(write))"
     ```
 
 === "Complex 5-stage pipeline"
     <figure markdown>
       ![simple pipeline hybrid](./assets/test_generic_pipeline_hybrid_5_stages.svg){ width="1100" }
-      <figcaption>`spu-benchmark`: hybrid in/out and forward sockets & 5-stage pipeline.</figcaption>
+      <figcaption>`benchmark-custom-chain`: hybrid in/out and forward sockets & 5-stage pipeline.</figcaption>
     </figure>
     ```bash
-    spu-benchmark -e 100 -t "1,3,1,2,1" -r "((init,relayf,incr),(relayf,relay),(incrf),(relay),(relay,fin))"
+    benchmark-custom-chain -e 100 -t "1,3,1,2,1" -r "((init,relayf,incr),(relayf,relay),(incrf),(relay),(relay,fin))"
     ```
 
 ------
@@ -185,7 +185,7 @@ Moreover, for each stage it is possible to specify the number of replications
 The following verbatim is a copy-paste from the `-h` stdout:
 
 ```bash
-usage: spu-benchmark [options]
+usage: benchmark-custom-chain [options]
 
   -t, --n-threads          Number of threads to run in parallel for each stage                         [empty]
   -f, --n-inter-frames     Number of frames to process in one task                                     [1]
