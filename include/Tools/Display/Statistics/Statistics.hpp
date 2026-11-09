@@ -34,8 +34,11 @@ namespace tools
 // Low-overhead, architecture-portable timestamp counter for Real-Time (RT) latency and jitter measurements:
 // - x86 / x86_64: reads the invariant Time Stamp Counter via `rdtsc` (~2.5 ns, 1 instruction).
 // - ARM64 (AArch64): reads the EL0 virtual timer counter register `cntvct_el0` (~1-2 ns, 1 instruction).
+// - ARM32 (`armhf`, ARMv8 AArch32 `__ARM_ARCH >= 8`): reads the 64-bit Generic Timer `CNTVCT` via `mrrc p15, 1, c14`
+//   (1 instruction; on older ARMv7-A where `CNTVCT` is optional, e.g. Cortex-A9 Zynq-7000, falls through to
+//   `steady_clock::now()` which uses the Linux vDSO without risking `SIGILL`).
 // - RISC-V (RV64 / RV32 `Zicntr`): reads the `time` CSR via `rdtime` (~1-2 ns, 1 instruction).
-// - Fallback (any other architecture): uses C++11 `std::chrono::steady_clock::now()` in nanoseconds.
+// - Fallback (ARMv7-A and any other architecture): uses C++11 `std::chrono::steady_clock::now()` in nanoseconds.
 // Ticks are converted to nanoseconds after execution using the wall-clock/tick ratio calibrated over the run.
 inline uint64_t
 read_tsc() noexcept
@@ -50,6 +53,10 @@ read_tsc() noexcept
     uint64_t val;
     __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
     return val;
+#elif defined(__arm__) && defined(__ARM_ARCH) && (__ARM_ARCH >= 8)
+    uint32_t lo, hi;
+    __asm__ __volatile__("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
 #elif defined(__riscv) && (__riscv_xlen == 64)
     uint64_t val;
     __asm__ __volatile__("rdtime %0" : "=r"(val));
