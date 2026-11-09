@@ -500,13 +500,14 @@ measure_sequence_bench(const std::string& name,
                        runtime::Sequence& seq,
                        const size_t n_exec,
                        const bool collect_rt_percentiles,
+                       const size_t n_warmup = 256,
+                       const size_t rt_skip = 0,
                        const bool with_statuses = false,
                        const size_t task_divisor_override = 0,
                        const bool per_thread = false)
 {
     const size_t n_tasks = task_divisor_override ? task_divisor_override : seq.get_tasks_per_types().size();
     const size_t n_threads = std::max<size_t>(1, seq.get_n_threads());
-    const size_t n_warm = std::min<size_t>(std::max<size_t>(10, n_exec / 10), 5000);
     seq.set_rt_stats(false);
 
     Seq_bench_result res;
@@ -516,11 +517,14 @@ measure_sequence_bench(const std::string& name,
 
     if (per_thread && n_threads > 1)
     {
-        std::atomic<size_t> w_cnt(0);
-        if (!with_statuses)
-            seq.exec([&w_cnt, n_warm]() { return ++w_cnt >= n_warm; });
-        else
-            seq.exec([&w_cnt, n_warm](const std::vector<const int*>&) { return ++w_cnt >= n_warm; });
+        if (n_warmup > 0)
+        {
+            std::atomic<size_t> w_cnt(0);
+            if (!with_statuses)
+                seq.exec([&w_cnt, n_warmup]() { return ++w_cnt >= n_warmup; });
+            else
+                seq.exec([&w_cnt, n_warmup](const std::vector<const int*>&) { return ++w_cnt >= n_warmup; });
+        }
 
         std::atomic<size_t> cnt(0);
         const auto t0_clk = std::chrono::steady_clock::now();
@@ -542,7 +546,7 @@ measure_sequence_bench(const std::string& name,
         if (collect_rt_percentiles)
         {
             seq.reset_rt_stats();
-            seq.set_rt_stats(true);
+            seq.set_rt_stats(true, rt_skip);
             std::atomic<size_t> c2(0);
             if (!with_statuses)
                 seq.exec([&c2, n_exec]() { return ++c2 >= n_exec; });
@@ -565,11 +569,14 @@ measure_sequence_bench(const std::string& name,
         return res;
     }
 
-    size_t w = 0;
-    if (!with_statuses)
-        seq.exec([&w, n_warm]() { return ++w >= n_warm; });
-    else
-        seq.exec([&w, n_warm](const std::vector<const int*>&) { return ++w >= n_warm; });
+    if (n_warmup > 0)
+    {
+        size_t w = 0;
+        if (!with_statuses)
+            seq.exec([&w, n_warmup]() { return ++w >= n_warmup; });
+        else
+            seq.exec([&w, n_warmup](const std::vector<const int*>&) { return ++w >= n_warmup; });
+    }
 
     size_t c1 = 0;
     const auto t0_clk = std::chrono::steady_clock::now();
@@ -591,7 +598,7 @@ measure_sequence_bench(const std::string& name,
     if (collect_rt_percentiles)
     {
         seq.reset_rt_stats();
-        seq.set_rt_stats(true);
+        seq.set_rt_stats(true, rt_skip);
         size_t c2 = 0;
         if (!with_statuses)
             seq.exec([&c2, n_exec]() { return ++c2 >= n_exec; });
@@ -647,18 +654,17 @@ main(int argc, char** argv)
     const bool has_julia = false;
 #endif
 
-    option longopts[] = { { "n-exec", required_argument, NULL, 'e' },
-                          { "data-length", required_argument, NULL, 'd' },
-                          { "backends", required_argument, NULL, 'b' },
-                          { "csv", required_argument, NULL, 'C' },
-                          { "rt-stats", no_argument, NULL, 'r' },
-                          { "rt-skip", required_argument, NULL, 'R' },
-                          { "rt-frames", no_argument, NULL, 'F' },
-                          { "help", no_argument, NULL, 'h' },
-                          { NULL, 0, NULL, 0 } };
+    option longopts[] = {
+        { "n-exec", required_argument, NULL, 'e' },   { "data-length", required_argument, NULL, 'd' },
+        { "backends", required_argument, NULL, 'b' }, { "csv", required_argument, NULL, 'C' },
+        { "warmup", required_argument, NULL, 'W' },   { "rt-stats", no_argument, NULL, 'r' },
+        { "rt-skip", required_argument, NULL, 'R' },  { "rt-frames", no_argument, NULL, 'F' },
+        { "help", no_argument, NULL, 'h' },           { NULL, 0, NULL, 0 }
+    };
 
     size_t n_exec = 300000;
     size_t data_length = 64;
+    size_t n_warmup = 256;
     size_t rt_skip = 0;
     bool rt_frames = false;
     bool show_full_rt_tables = false;
@@ -666,7 +672,7 @@ main(int argc, char** argv)
 
     while (1)
     {
-        const int opt = getopt_long(argc, argv, "e:d:b:C:R:Frh", longopts, 0);
+        const int opt = getopt_long(argc, argv, "e:d:b:C:W:R:Frh", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -681,6 +687,9 @@ main(int argc, char** argv)
                 break;
             case 'C':
                 csv_path = optarg;
+                break;
+            case 'W':
+                n_warmup = std::atoi(optarg);
                 break;
             case 'r':
                 show_full_rt_tables = true;
@@ -701,6 +710,8 @@ main(int argc, char** argv)
                           << "]" << std::endl;
                 std::cout << "  -C, --csv          Optional path to export benchmark results as CSV [none]"
                           << std::endl;
+                std::cout << "  -W, --warmup       Number of warmup streams before each benchmark   [" << n_warmup
+                          << "]" << std::endl;
                 std::cout << "  -r, --rt-stats     Also print full tools::Stats::show_rt tables     [false]"
                           << std::endl;
                 std::cout << "  -R, --rt-skip      Number of initial frames to skip in RT           [" << rt_skip << "]"
@@ -742,6 +753,8 @@ main(int argc, char** argv)
     std::cout << "#######################################################################" << std::endl;
     std::cout << "#   - base n_exec  = " << n_exec << " (scaled for JL_SAFE / long chains)" << std::endl;
     std::cout << "#   - data_length  = " << data_length << " bytes" << std::endl;
+    std::cout << "#   - n_warmup     = " << n_warmup << std::endl;
+    std::cout << "#   - rt_skip      = " << rt_skip << std::endl;
     std::cout << "#   - has_julia    = " << (has_julia ? "true" : "false") << std::endl;
     std::cout << "#   - backends     = " << active_backends_joined << std::endl;
     std::cout << "#   - display mode = "
@@ -759,7 +772,7 @@ main(int argc, char** argv)
     if (has_cpp)
     {
         const size_t n_tasks = 8;
-        for (size_t i = 0; i < 10000; i++)
+        for (size_t i = 0; i < n_warmup; i++)
             for (size_t t = 0; t < n_tasks; t++)
                 empty_kernel_0(t);
 
@@ -792,7 +805,7 @@ main(int argc, char** argv)
                 for (size_t t = 0; t < n_tasks; t++)
                     empty_kernel_0(t);
                 const uint64_t s1 = tools::read_tsc();
-                raw_stats.add_sample(s1 - s0);
+                if (i >= rt_skip) raw_stats.add_sample(s1 - s0);
             }
             bare_r.std_ns_per_frame = raw_stats.get_std_ticks() * ns_per_tick;
             bare_r.p50_ns_per_frame = raw_stats.get_percentile_ticks(50.0) * ns_per_tick;
@@ -829,7 +842,7 @@ main(int argc, char** argv)
             std::vector<std::string> chain_b(8, b);
             auto bc = build_chain(chain_b, c.topo, data_length, 1, 1, c.no_copy);
             const size_t ne = choose_n_exec(n_exec, chain_b);
-            const auto res = measure_sequence_bench(c.label, b, *bc.seq, ne, single_backend_rt_mode);
+            const auto res = measure_sequence_bench(c.label, b, *bc.seq, ne, single_backend_rt_mode, n_warmup, rt_skip);
             row_vals.push_back(res);
             csv_rows.push_back({ "1_socket_types", c.label, res });
 
@@ -858,7 +871,7 @@ main(int argc, char** argv)
             std::vector<std::string> chain_b(8, b);
             auto bc = build_chain(chain_b, "SFWD", data_length, n_scks, 1, true);
             const size_t ne = choose_n_exec(n_exec, chain_b);
-            const auto res = measure_sequence_bench(label, b, *bc.seq, ne, single_backend_rt_mode);
+            const auto res = measure_sequence_bench(label, b, *bc.seq, ne, single_backend_rt_mode, n_warmup, rt_skip);
             row_vals.push_back(res);
             csv_rows.push_back({ "2_n_sockets", label, res });
         }
@@ -881,7 +894,8 @@ main(int argc, char** argv)
             std::vector<std::string> chain_b(8, "CPP");
             auto bc = build_chain(chain_b, "SFWD", data_length, 1, 1, true, true, false, 1, 1, cc.first);
             const size_t ne = choose_n_exec(n_exec, chain_b);
-            const auto res = measure_sequence_bench(cc.second, "CPP", *bc.seq, ne, single_backend_rt_mode);
+            const auto res =
+              measure_sequence_bench(cc.second, "CPP", *bc.seq, ne, single_backend_rt_mode, n_warmup, rt_skip);
 
             std::vector<Seq_bench_result> row_vals;
             for (const auto& b : backends)
@@ -955,7 +969,8 @@ main(int argc, char** argv)
                                 t->set_fast(true);
 
                         const size_t ne = choose_n_exec(n_exec, { b });
-                        const auto res = measure_sequence_bench(label, b, seq, ne, single_backend_rt_mode);
+                        const auto res =
+                          measure_sequence_bench(label, b, seq, ne, single_backend_rt_mode, n_warmup, rt_skip);
                         row_vals.push_back(res);
                         csv_rows.push_back({ "3_cpp_capture_and_jl_state", label, res });
                     }
@@ -992,7 +1007,8 @@ main(int argc, char** argv)
             std::vector<std::string> chain_b(8, b);
             auto bc = build_chain(chain_b, "SFWD", data_length, 1, 1, true, mc.fast_m, mc.stats_m);
             const size_t ne = choose_n_exec(n_exec, chain_b, mc.scale);
-            const auto res = measure_sequence_bench(mc.label, b, *bc.seq, ne, single_backend_rt_mode, mc.with_st);
+            const auto res =
+              measure_sequence_bench(mc.label, b, *bc.seq, ne, single_backend_rt_mode, n_warmup, rt_skip, mc.with_st);
             row_vals.push_back(res);
             csv_rows.push_back({ "4_exec_modes", mc.label, res });
         }
@@ -1013,7 +1029,7 @@ main(int argc, char** argv)
             std::vector<std::string> chain_b(chain_len, b);
             auto bc = build_chain(chain_b, "SFWD", data_length);
             const size_t ne = choose_n_exec(n_exec, chain_b, scale);
-            const auto res = measure_sequence_bench(label, b, *bc.seq, ne, single_backend_rt_mode);
+            const auto res = measure_sequence_bench(label, b, *bc.seq, ne, single_backend_rt_mode, n_warmup, rt_skip);
             row_vals.push_back(res);
             csv_rows.push_back({ "5_chain_length", label, res });
         }
@@ -1035,7 +1051,8 @@ main(int argc, char** argv)
             std::vector<std::string> chain_b(8, b);
             auto bc = build_chain(chain_b, "SFWD", data_length, 1, 1, true, true, false, n_waves, 1);
             const size_t ne = choose_n_exec(n_exec, chain_b, scale);
-            const auto res = measure_sequence_bench(label, b, *bc.seq, ne, single_backend_rt_mode, false, 8 * n_waves);
+            const auto res = measure_sequence_bench(
+              label, b, *bc.seq, ne, single_backend_rt_mode, n_warmup, rt_skip, false, 8 * n_waves);
             row_vals.push_back(res);
             csv_rows.push_back({ "6_multi_wave", label, res });
         }
@@ -1055,7 +1072,8 @@ main(int argc, char** argv)
             std::vector<std::string> chain_b(8, b);
             auto bc = build_chain(chain_b, "SFWD", data_length, 1, n_threads);
             const size_t ne = choose_n_exec(n_exec, chain_b, (double)n_threads);
-            const auto res = measure_sequence_bench(label, b, *bc.seq, ne, single_backend_rt_mode, false, 0, true);
+            const auto res =
+              measure_sequence_bench(label, b, *bc.seq, ne, single_backend_rt_mode, n_warmup, rt_skip, false, 0, true);
             row_vals.push_back(res);
             csv_rows.push_back({ "7_multithread_and_ctrl", label, res });
         }
@@ -1072,7 +1090,8 @@ main(int argc, char** argv)
             auto bc = build_chain(het_pattern, "SFWD", data_length, 1, n_threads);
             const size_t ne = choose_n_exec(n_exec, het_pattern, (double)n_threads);
             const std::string label = "Heterogeneous (CPP+JL_UNSAFE, t=" + std::to_string(n_threads) + ")";
-            const auto res = measure_sequence_bench(label, "MIXED", *bc.seq, ne, false, false, 0, true);
+            const auto res =
+              measure_sequence_bench(label, "MIXED", *bc.seq, ne, false, n_warmup, rt_skip, false, 0, true);
             std::cout << "#  " << std::left << std::setw(39) << label.substr(0, 39) << std::right
                       << " |     8 | ns/stm || " << std::setw(12) << fmt_ns(res.ns_per_frame)
                       << " (mixed CPP + JL_UNSAFE)" << std::endl;
@@ -1128,7 +1147,8 @@ main(int argc, char** argv)
                     t->set_fast(true);
 
             const size_t ne = choose_n_exec(n_exec, { b });
-            const auto res = measure_sequence_bench(label, b, seq, ne, single_backend_rt_mode, false, 6);
+            const auto res =
+              measure_sequence_bench(label, b, seq, ne, single_backend_rt_mode, n_warmup, rt_skip, false, 6);
             row_vals.push_back(res);
             csv_rows.push_back({ "7_multithread_and_ctrl", label, res });
         }

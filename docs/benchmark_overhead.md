@@ -234,6 +234,8 @@ flowchart LR
     #######################################################################
     #   - base n_exec  = 100000 (scaled for JL_SAFE / long chains)
     #   - data_length  = 64 bytes
+    #   - n_warmup     = 256
+    #   - rt_skip      = 0
     #   - has_julia    = true
     #   - backends     = CPP, JL_UNSAFE, JL_SAFE
     #   - display mode = Multi-Backend Average Comparison (pass -b <BACKEND> for RT percentiles)
@@ -267,6 +269,8 @@ flowchart LR
     #######################################################################
     #   - base n_exec  = 100000 (scaled for JL_SAFE / long chains)
     #   - data_length  = 64 bytes
+    #   - n_warmup     = 256
+    #   - rt_skip      = 0
     #   - has_julia    = true
     #   - backends     = CPP
     #   - display mode = Single-Backend Full RT Percentiles (AVG, STD, P50..P99.99, MAX)
@@ -396,7 +400,8 @@ flowchart LR
     #######################################################################
     #   - base n_exec   = 20000 (scaled for passive wait / JL_SAFE)
     #   - data_length   = 64 bytes
-    #   - n_skip_frames = 0
+    #   - n_warmup      = 256
+    #   - rt_skip       = 0
     #   - has_julia     = true
     #   - backends      = CPP, JL_UNSAFE, JL_SAFE
     #   - display_mode  = Multi-Backend Average Comparison (use -b <BACKEND> for full RT percentiles)
@@ -428,7 +433,8 @@ flowchart LR
     #######################################################################
     #   - base n_exec   = 20000 (scaled for passive wait / JL_SAFE)
     #   - data_length   = 64 bytes
-    #   - n_skip_frames = 0
+    #   - n_warmup      = 256
+    #   - rt_skip       = 0
     #   - has_julia     = true
     #   - backends      = CPP
     #   - display_mode  = Single-Backend Full RT Percentiles (E2E ns/stm + STG ns/tsk)

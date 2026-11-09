@@ -234,17 +234,21 @@ measure_pipeline(const std::string& name,
                  const std::string& backend,
                  runtime::Pipeline& pipe,
                  const size_t n_exec,
+                 const size_t n_warmup = 256,
                  const size_t n_skip_frames = 0)
 {
     for (auto* m : pipe.get_modules<module::Module>(false))
         for (auto& t : m->tasks)
             t->set_fast(true);
 
-    // Warmup run (16 frames) to warm caches and trigger Julia JIT compilation on all worker threads
+    // Warmup run to warm caches, pre-populate Socket_jl_cache for all ring-buffer slots, and trigger Julia JIT
+    if (n_warmup > 0)
     {
         std::atomic<size_t> w(0);
         pipe.set_rt_stats(false);
-        pipe.exec([&w]() { return ++w >= 16; });
+        pipe.exec([&w, n_warmup]() { return ++w >= n_warmup; });
+        for (auto* m : pipe.get_modules<tools::Interface_reset>(false))
+            m->reset();
     }
 
     pipe.reset_rt_stats();
@@ -334,6 +338,7 @@ run_linear_pipeline_case(const std::string& name,
                          const size_t n_exec,
                          const size_t n_scks_per_task = 1,
                          const bool show_rt_table = false,
+                         const size_t n_warmup = 256,
                          const size_t n_skip_frames = 0,
                          const bool rt_frames = false)
 {
@@ -425,7 +430,7 @@ run_linear_pipeline_case(const std::string& name,
         stg->set_no_copy_mode(no_copy_mode);
 
     const size_t cur_exec = choose_pipe_n_exec(n_exec, backend, active_wait);
-    Pipe_bench_result res = measure_pipeline(name, backend, pipe, cur_exec, n_skip_frames);
+    Pipe_bench_result res = measure_pipeline(name, backend, pipe, cur_exec, n_warmup, n_skip_frames);
 
     if (show_rt_table)
     {
@@ -480,24 +485,23 @@ main(int argc, char** argv)
 
     size_t n_exec = 50000;
     size_t data_length = 64;
+    size_t n_warmup = 256;
     size_t n_skip_frames = 0;
     bool rt_frames = false;
     bool show_full_rt_tables = false;
     std::string csv_path;
 
-    const option longopts[] = { { "n-exec", required_argument, NULL, 'e' },
-                                { "data-length", required_argument, NULL, 'd' },
-                                { "backends", required_argument, NULL, 'b' },
-                                { "csv", required_argument, NULL, 'C' },
-                                { "rt-skip", required_argument, NULL, 'k' },
-                                { "rt-frames", no_argument, NULL, 'F' },
-                                { "rt-stats", no_argument, NULL, 'r' },
-                                { "help", no_argument, NULL, 'h' },
-                                { 0, 0, 0, 0 } };
+    const option longopts[] = {
+        { "n-exec", required_argument, NULL, 'e' },   { "data-length", required_argument, NULL, 'd' },
+        { "backends", required_argument, NULL, 'b' }, { "csv", required_argument, NULL, 'C' },
+        { "warmup", required_argument, NULL, 'W' },   { "rt-skip", required_argument, NULL, 'R' },
+        { "rt-frames", no_argument, NULL, 'F' },      { "rt-stats", no_argument, NULL, 'r' },
+        { "help", no_argument, NULL, 'h' },           { 0, 0, 0, 0 }
+    };
 
     while (true)
     {
-        const int opt = getopt_long(argc, argv, "e:d:b:C:k:R:Frh", longopts, 0);
+        const int opt = getopt_long(argc, argv, "e:d:b:C:W:k:R:Frh", longopts, 0);
         if (opt == -1) break;
         switch (opt)
         {
@@ -512,6 +516,9 @@ main(int argc, char** argv)
                 break;
             case 'C':
                 csv_path = optarg;
+                break;
+            case 'W':
+                n_warmup = std::atoi(optarg);
                 break;
             case 'k':
             case 'R':
@@ -534,9 +541,11 @@ main(int argc, char** argv)
                 std::cout << "                     (Specify a single backend e.g. -b CPP or -b JL_UNSAFE" << std::endl;
                 std::cout << "                      to display full RT percentiles + MAX for every case)" << std::endl;
                 std::cout << "  -C, --csv          Optional path to export benchmark results (CSV) [none]" << std::endl;
+                std::cout << "  -W, --warmup       Number of warmup streams before each benchmark  [" << n_warmup << "]"
+                          << std::endl;
                 std::cout << "  -r, --rt-stats     Also print full tools::Stats::show_rt tables    [false]"
                           << std::endl;
-                std::cout << "  -k, --rt-skip      Number of initial frames to skip in RT          [" << n_skip_frames
+                std::cout << "  -R, --rt-skip      Number of initial frames to skip in RT          [" << n_skip_frames
                           << "]" << std::endl;
                 std::cout << "  -F, --rt-frames    Display RT throughput in frames/s               [false]"
                           << std::endl;
@@ -573,7 +582,8 @@ main(int argc, char** argv)
     std::cout << "#######################################################################" << std::endl;
     std::cout << "#   - base n_exec   = " << n_exec << " (scaled for passive wait / JL_SAFE)" << std::endl;
     std::cout << "#   - data_length   = " << data_length << " bytes" << std::endl;
-    std::cout << "#   - n_skip_frames = " << n_skip_frames << std::endl;
+    std::cout << "#   - n_warmup      = " << n_warmup << std::endl;
+    std::cout << "#   - rt_skip       = " << n_skip_frames << std::endl;
     std::cout << "#   - has_julia     = " << (has_julia ? "true" : "false") << std::endl;
     std::cout << "#   - backends      = " << active_backends_joined << std::endl;
     if (backends.size() == 1)
@@ -599,8 +609,20 @@ main(int argc, char** argv)
             {
                 const std::string rt_label = std::string(active ? "active_wait=true" : "active_wait=false") +
                                              ", buf=" + std::to_string(bsize) + " (" + b + ")";
-                auto r = run_linear_pipeline_case(
-                  rt_label, b, 2, 2, { 1, 1 }, bsize, active, true, data_length, n_exec, 1, false, n_skip_frames);
+                auto r = run_linear_pipeline_case(rt_label,
+                                                  b,
+                                                  2,
+                                                  2,
+                                                  { 1, 1 },
+                                                  bsize,
+                                                  active,
+                                                  true,
+                                                  data_length,
+                                                  n_exec,
+                                                  1,
+                                                  false,
+                                                  n_warmup,
+                                                  n_skip_frames);
                 row_res.push_back(r);
                 csv_rows.push_back({ "1_waiting_strategy", label, r });
             }
@@ -630,6 +652,7 @@ main(int argc, char** argv)
                                               n_exec,
                                               1,
                                               false,
+                                              n_warmup,
                                               n_skip_frames);
             row_res.push_back(r);
             csv_rows.push_back({ "2_buffer_size", label, r });
@@ -664,6 +687,7 @@ main(int argc, char** argv)
                                                   n_exec,
                                                   1,
                                                   show_rt,
+                                                  n_warmup,
                                                   n_skip_frames,
                                                   rt_frames);
                 row_res.push_back(r);
@@ -684,8 +708,20 @@ main(int argc, char** argv)
         for (const auto& b : backends)
         {
             const std::string rt_label = "3 stages: 1->" + std::to_string(mid_t) + "->1 threads (" + b + ")";
-            auto r = run_linear_pipeline_case(
-              rt_label, b, 3, 2, { 1, mid_t, 1 }, 16, true, true, data_length, n_exec, 1, false, n_skip_frames);
+            auto r = run_linear_pipeline_case(rt_label,
+                                              b,
+                                              3,
+                                              2,
+                                              { 1, mid_t, 1 },
+                                              16,
+                                              true,
+                                              true,
+                                              data_length,
+                                              n_exec,
+                                              1,
+                                              false,
+                                              n_warmup,
+                                              n_skip_frames);
             row_res.push_back(r);
             csv_rows.push_back({ "4_multithread_stage", label, r });
         }
@@ -705,8 +741,20 @@ main(int argc, char** argv)
             std::vector<Pipe_bench_result> row_res;
             for (const auto& b : backends)
             {
-                auto r = run_linear_pipeline_case(
-                  label + " (" + b + ")", b, 2, 2, { 1, 1 }, 4, true, no_copy, bytes, n_exec, 1, false, n_skip_frames);
+                auto r = run_linear_pipeline_case(label + " (" + b + ")",
+                                                  b,
+                                                  2,
+                                                  2,
+                                                  { 1, 1 },
+                                                  4,
+                                                  true,
+                                                  no_copy,
+                                                  bytes,
+                                                  n_exec,
+                                                  1,
+                                                  false,
+                                                  n_warmup,
+                                                  n_skip_frames);
                 row_res.push_back(r);
                 csv_rows.push_back({ "5_copy_vs_zerocopy", label, r });
             }
@@ -736,6 +784,7 @@ main(int argc, char** argv)
                                               n_exec,
                                               n_scks,
                                               false,
+                                              n_warmup,
                                               n_skip_frames);
             row_res.push_back(r);
             csv_rows.push_back({ "6_adaptor_sockets", label, r });
