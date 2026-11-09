@@ -102,23 +102,37 @@ class Adaptor_m_to_n
         // --- Pusher-owned cache line (written exclusively by the upstream Pusher thread) ---
         std::atomic<uint64_t> write_pos; // Total frames published by the Pusher since reset
         uint64_t read_pos_cache;         // Pusher's private shadow copy of `read_pos`
+        int8_t** push_slots_base;        // Direct pointer to channel's slot table `&(*flat_buffer)[d * cap * n_scks]`
+        uint64_t* push_ts_base;          // Direct pointer to channel's timestamp ring `(*ts_buffer)[d].data()`
         uint32_t write_slot;             // Current ring-buffer slot index in `[0, capacity - 1]`
-        uint8_t pad_pusher[SPU_CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>) - sizeof(uint64_t) - sizeof(uint32_t)];
+        uint32_t push_n_channels;        // Cached total number of sub-channels (`ppcm`) to avoid `buffer->size()` load
+        uint8_t pad_pusher[SPU_CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>) - sizeof(uint64_t) - sizeof(int8_t**) -
+                           sizeof(uint64_t*) - sizeof(uint32_t) - sizeof(uint32_t)];
 
         // --- Puller-owned cache line (written exclusively by the downstream Puller thread) ---
         std::atomic<uint64_t> read_pos; // Total frames consumed by the Puller since reset
         uint64_t write_pos_cache;       // Puller's private shadow copy of `write_pos`
+        int8_t** pull_slots_base;       // Direct pointer to channel's slot table `&(*flat_buffer)[d * cap * n_scks]`
+        uint64_t* pull_ts_base;         // Direct pointer to channel's timestamp ring `(*ts_buffer)[d].data()`
         uint32_t read_slot;             // Current ring-buffer slot index in `[0, capacity - 1]`
-        uint8_t pad_puller[SPU_CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>) - sizeof(uint64_t) - sizeof(uint32_t)];
+        uint32_t pull_n_channels;       // Cached total number of sub-channels (`ppcm`) to avoid `buffer->size()` load
+        uint8_t pad_puller[SPU_CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>) - sizeof(uint64_t) - sizeof(int8_t**) -
+                           sizeof(uint64_t*) - sizeof(uint32_t) - sizeof(uint32_t)];
 
         inline SPSC_channel_sync() noexcept
           : write_pos(0)
           , read_pos_cache(0)
+          , push_slots_base(nullptr)
+          , push_ts_base(nullptr)
           , write_slot(0)
+          , push_n_channels(1)
           , pad_pusher{}
           , read_pos(0)
           , write_pos_cache(0)
+          , pull_slots_base(nullptr)
+          , pull_ts_base(nullptr)
           , read_slot(0)
+          , pull_n_channels(1)
           , pad_puller{}
         {
         }
@@ -126,11 +140,17 @@ class Adaptor_m_to_n
         inline SPSC_channel_sync(const SPSC_channel_sync& other) noexcept
           : write_pos(other.write_pos.load(std::memory_order_relaxed))
           , read_pos_cache(other.read_pos_cache)
+          , push_slots_base(other.push_slots_base)
+          , push_ts_base(other.push_ts_base)
           , write_slot(other.write_slot)
+          , push_n_channels(other.push_n_channels)
           , pad_pusher{}
           , read_pos(other.read_pos.load(std::memory_order_relaxed))
           , write_pos_cache(other.write_pos_cache)
+          , pull_slots_base(other.pull_slots_base)
+          , pull_ts_base(other.pull_ts_base)
           , read_slot(other.read_slot)
+          , pull_n_channels(other.pull_n_channels)
           , pad_puller{}
         {
         }
@@ -141,10 +161,16 @@ class Adaptor_m_to_n
             {
                 this->write_pos.store(other.write_pos.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 this->read_pos_cache = other.read_pos_cache;
+                this->push_slots_base = other.push_slots_base;
+                this->push_ts_base = other.push_ts_base;
                 this->write_slot = other.write_slot;
+                this->push_n_channels = other.push_n_channels;
                 this->read_pos.store(other.read_pos.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 this->write_pos_cache = other.write_pos_cache;
+                this->pull_slots_base = other.pull_slots_base;
+                this->pull_ts_base = other.pull_ts_base;
                 this->read_slot = other.read_slot;
+                this->pull_n_channels = other.pull_n_channels;
             }
             return *this;
         }
@@ -160,25 +186,39 @@ class Adaptor_m_to_n
         }
 
         // Called by the Pusher thread: checks if all `capacity` slots are occupied.
-        // Fast path reads only the Pusher's own cache line (`write_pos` and `read_pos_cache`).
-        // Slow path refreshes `read_pos_cache` from the Puller's `read_pos` with `memory_order_acquire`.
+        // 1. Fast path: reads only the Pusher's own cache line (`write_pos` and `read_pos_cache`).
+        // 2. Slow path: loads the Puller's `read_pos` with `memory_order_acquire` into a local register `r`.
+        //    CRITICAL (Zero-Store Spin): while spinning (`w - r >= capacity`), we MUST NOT write `r` back to
+        //    `this->read_pos_cache`. Writing to `read_pos_cache` on every spin iteration would dirty the Pusher's
+        //    cache line (which also holds `write_pos`), forcing a `Shared -> Modified` coherence transition that
+        //    invalidates the Puller's L1 cache while the Puller is trying to read `write_pos`. We only update
+        //    `this->read_pos_cache = r` once a free slot is observed (`return false`).
         inline bool is_full(const size_t capacity) noexcept
         {
             const uint64_t w = this->write_pos.load(std::memory_order_relaxed);
             if (w - this->read_pos_cache < capacity) return false;
-            this->read_pos_cache = this->read_pos.load(std::memory_order_acquire);
-            return (w - this->read_pos_cache) >= capacity;
+            const uint64_t r = this->read_pos.load(std::memory_order_acquire);
+            if (w - r >= capacity) return true;
+            this->read_pos_cache = r;
+            return false;
         }
 
         // Called by the Puller thread: checks if no filled slot is available.
-        // Fast path reads only the Puller's own cache line (`read_pos` and `write_pos_cache`).
-        // Slow path refreshes `write_pos_cache` from the Pusher's `write_pos` with `memory_order_acquire`.
+        // 1. Fast path: reads only the Puller's own cache line (`read_pos` and `write_pos_cache`).
+        // 2. Slow path: loads the Pusher's `write_pos` with `memory_order_acquire` into a local register `w`.
+        //    CRITICAL (Zero-Store Spin): while spinning (`r == w`), we MUST NOT write `w` back to
+        //    `this->write_pos_cache`. Writing to `write_pos_cache` on every spin iteration would dirty the Puller's
+        //    cache line (which also holds `read_pos`), forcing a `Shared -> Modified` coherence transition that
+        //    invalidates the Pusher's L1 cache while the Pusher is trying to read `read_pos`. We only update
+        //    `this->write_pos_cache = w` once at least one filled slot is observed (`return false`).
         inline bool is_empty() noexcept
         {
             const uint64_t r = this->read_pos.load(std::memory_order_relaxed);
             if (r != this->write_pos_cache) return false;
-            this->write_pos_cache = this->write_pos.load(std::memory_order_acquire);
-            return r == this->write_pos_cache;
+            const uint64_t w = this->write_pos.load(std::memory_order_acquire);
+            if (r == w) return true;
+            this->write_pos_cache = w;
+            return false;
         }
 
         // Called by the Pusher thread after writing/swapping the slot at `write_slot`:
@@ -227,10 +267,15 @@ class Adaptor_m_to_n
     const size_t buffer_size;
     const size_t n_sockets;
 
-    std::shared_ptr<std::vector<std::vector<std::vector<int8_t*>>>> buffer;
+    // Flat 1D slot-major buffer table indexed as `(d * buffer_size + b) * n_sockets + s`.
+    // Eliminates the 4-level pointer chase of a 3D nested vector on every `get_empty_buffer` / `get_filled_buffer`
+    // call and groups all sockets `s = 0 .. n_sockets - 1` of the same ring-buffer slot `b` into the same cache line.
+    std::shared_ptr<std::vector<int8_t*>> buffer;
     std::vector<int8_t*> buffer_to_free;
 
     std::shared_ptr<std::vector<SPSC_channel_sync>> channels;
+    SPSC_channel_sync*
+      channels_ptr; // Direct pointer to `channels->data()` avoiding `shared_ptr` + `vector` indirection
 
     std::shared_ptr<std::atomic<bool>> waiting_canceled;
 
@@ -315,8 +360,6 @@ class Adaptor_m_to_n
     inline bool is_no_copy_pull() const noexcept;
     void reset_buffer();
 
-    void push(const std::vector<const int8_t*>& in, const size_t frame_id);
-    void pull(const std::vector<int8_t*>& out, const size_t frame_id);
     void push(const runtime::Task& t, const size_t base_sck, const size_t frame_id);
     void pull(runtime::Task& t, const size_t base_sck, const size_t frame_id);
 

@@ -864,15 +864,26 @@ Sequence::apply_custom_process_rebind(Sub_sequence* contents, Task* task, const 
         case process_t::ADAPTOR_PULL:
         {
             auto* adp_pull = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
-            for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id].size(); sin_id++)
+            auto& rebind_scks = contents->rebind_sockets[rebind_id];
+            const size_t n_scks = rebind_scks.size();
+            for (size_t sin_id = 0; sin_id < n_scks; sin_id++)
             {
-                if (contents->rebind_sockets[rebind_id][sin_id].size() > 1)
+                auto& scks = rebind_scks[sin_id];
+                const size_t n_bound = scks.size();
+                if (n_bound > 1)
                 {
-                    auto swap_buff = contents->rebind_sockets[rebind_id][sin_id][1]->_get_dataptr();
+                    Socket* const* sck_ptrs = scks.data();
+                    auto swap_buff = sck_ptrs[1]->_get_dataptr();
                     auto buff = adp_pull->get_filled_buffer(sin_id, swap_buff);
-                    contents->rebind_sockets[rebind_id][sin_id][1]->dataptr = buff;
-                    for (size_t ta = 2; ta < contents->rebind_sockets[rebind_id][sin_id].size(); ta++)
-                        contents->rebind_sockets[rebind_id][sin_id][ta]->dataptr = buff;
+                    // Single-pass zero-copy rebind: update both the adaptor's own output socket (`ta = 0`) and all
+                    // downstream bound sockets (`ta = 1 .. n_bound - 1`) in one loop so the `pull` codelet does not
+                    // need a separate per-socket pass before `apply_custom_process_rebind`.
+                    for (size_t ta = 0; ta < n_bound; ta++)
+                        sck_ptrs[ta]->dataptr = buff;
+                }
+                else if (n_bound == 1)
+                {
+                    scks[0]->dataptr = adp_pull->get_filled_buffer(sin_id);
                 }
             }
             adp_pull->wake_up_pusher();
@@ -881,13 +892,20 @@ Sequence::apply_custom_process_rebind(Sub_sequence* contents, Task* task, const 
         case process_t::ADAPTOR_PUSH:
         {
             auto* adp_push = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
-            for (size_t sout_id = 0; sout_id < contents->rebind_sockets[rebind_id].size(); sout_id++)
+            auto& rebind_scks = contents->rebind_sockets[rebind_id];
+            const size_t n_scks = rebind_scks.size();
+            for (size_t sout_id = 0; sout_id < n_scks; sout_id++)
             {
-                auto swap_buff = contents->rebind_sockets[rebind_id][sout_id][1]->_get_dataptr();
+                auto& scks = rebind_scks[sout_id];
+                const size_t n_bound = scks.size();
+                Socket* const* sck_ptrs = scks.data();
+                auto swap_buff = sck_ptrs[1]->_get_dataptr();
                 auto buff = adp_push->get_empty_buffer(sout_id, swap_buff);
-                contents->rebind_sockets[rebind_id][sout_id][1]->dataptr = buff;
-                for (size_t ta = 2; ta < contents->rebind_sockets[rebind_id][sout_id].size(); ta++)
-                    contents->rebind_sockets[rebind_id][sout_id][ta]->dataptr = buff;
+                // Single-pass zero-copy rebind: update both the adaptor's own input socket (`ta = 0`) and all
+                // upstream bound sockets (`ta = 1 .. n_bound - 1`) in one loop so the `push` codelet does not
+                // need a separate per-socket pass before `apply_custom_process_rebind`.
+                for (size_t ta = 0; ta < n_bound; ta++)
+                    sck_ptrs[ta]->dataptr = buff;
             }
             adp_push->wake_up_puller();
             break;
@@ -2380,10 +2398,8 @@ Sequence::gen_processes(const bool no_copy_mode)
         {
             already_parsed_nodes.push_back(cur_node);
 
-            std::map<runtime::Task*, std::function<const int*()>> modified_tasks;
             std::map<runtime::Task*, Custom_process_info> modified_custom_info;
             auto contents = cur_node->get_c();
-            contents->processes.clear();
             contents->custom_processes.clear();
             contents->rebind_sockets.clear();
             contents->rebind_dataptrs.clear();
@@ -2422,23 +2438,6 @@ Sequence::gen_processes(const bool no_copy_mode)
                     }
 
                     modified_custom_info[select_task] = { process_t::SWITCHER_SELECT, (uint32_t)rebind_id, switcher };
-                    modified_tasks[select_task] = [contents, select_task, switcher, rebind_id]() -> const int*
-                    {
-                        select_task->exec();
-                        const int* status = (const int*)select_task->sockets.back()->_get_dataptr();
-
-                        const auto path = switcher->get_path();
-                        const auto in_dataptr = select_task->sockets[path]->_get_dataptr();
-
-                        // rebind input sockets on the fly
-                        // there should be only one output socket at this time (sout_id == 0)
-                        for (size_t sout_id = 0; sout_id < contents->rebind_sockets[rebind_id].size(); sout_id++)
-                            for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id][sout_id].size();
-                                 sin_id++)
-                                contents->rebind_sockets[rebind_id][sout_id][sin_id]->dataptr = in_dataptr;
-
-                        return status;
-                    };
                 }
 
                 if (dynamic_cast<module::Switcher*>(&task->get_module()) &&
@@ -2473,19 +2472,6 @@ Sequence::gen_processes(const bool no_copy_mode)
                     }
 
                     modified_custom_info[commute_task] = { process_t::SWITCHER_COMMUTE, (uint32_t)rebind_id, switcher };
-                    modified_tasks[commute_task] = [contents, commute_task, switcher, rebind_id]() -> const int*
-                    {
-                        commute_task->exec();
-                        const int* status = (const int*)commute_task->sockets.back()->_get_dataptr();
-                        const auto in_dataptr = commute_task->sockets[0]->_get_dataptr();
-                        const auto path = switcher->get_path();
-
-                        // rebind input sockets on the fly
-                        for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id][path].size(); sin_id++)
-                            contents->rebind_sockets[rebind_id][path][sin_id]->dataptr = in_dataptr;
-
-                        return status;
-                    };
                 }
 
                 if (dynamic_cast<module::Adaptor_m_to_n*>(&task->get_module()) &&
@@ -2520,31 +2506,6 @@ Sequence::gen_processes(const bool no_copy_mode)
                     }
 
                     modified_custom_info[pull_task] = { process_t::ADAPTOR_PULL, (uint32_t)rebind_id, adp_pull };
-                    modified_tasks[pull_task] = [contents, pull_task, adp_pull, rebind_id]() -> const int*
-                    {
-                        // active or passive waiting here
-                        pull_task->exec();
-                        const int* status = (const int*)pull_task->sockets.back()->_get_dataptr();
-
-                        // rebind input sockets on the fly
-                        for (size_t sin_id = 0; sin_id < contents->rebind_sockets[rebind_id].size(); sin_id++)
-                        {
-                            if (contents->rebind_sockets[rebind_id][sin_id].size() > 1)
-                            {
-                                // we start to 1 because the rebinding of the 'pull_task' is made in the
-                                // 'pull_task->exec()' call (this way the debug mode is still working)
-                                auto swap_buff = contents->rebind_sockets[rebind_id][sin_id][1]->_get_dataptr();
-                                auto buff = adp_pull->get_filled_buffer(sin_id, swap_buff);
-                                contents->rebind_sockets[rebind_id][sin_id][1]->dataptr = buff;
-                                // for the next tasks the same buffer 'buff' is required, an easy mistake is to re-swap
-                                // and the data will be false, this is why we just bind 'buff'
-                                for (size_t ta = 2; ta < contents->rebind_sockets[rebind_id][sin_id].size(); ta++)
-                                    contents->rebind_sockets[rebind_id][sin_id][ta]->dataptr = buff;
-                            }
-                        }
-                        adp_pull->wake_up_pusher();
-                        return status;
-                    };
                 }
 
                 if (dynamic_cast<module::Adaptor_m_to_n*>(&task->get_module()) &&
@@ -2582,48 +2543,15 @@ Sequence::gen_processes(const bool no_copy_mode)
                         }
 
                     modified_custom_info[push_task] = { process_t::ADAPTOR_PUSH, (uint32_t)rebind_id, adp_push };
-                    modified_tasks[push_task] = [contents, push_task, adp_push, rebind_id]() -> const int*
-                    {
-                        // active or passive waiting here
-                        push_task->exec();
-                        const int* status = (const int*)push_task->sockets.back()->_get_dataptr();
-                        // rebind output sockets on the fly
-                        for (size_t sout_id = 0; sout_id < contents->rebind_sockets[rebind_id].size(); sout_id++)
-                        {
-                            // we start to 1 because the rebinding of the 'push_task' is made in the
-                            // 'push_task->exec()' call (this way the debug mode is still working)
-                            auto swap_buff = contents->rebind_sockets[rebind_id][sout_id][1]->_get_dataptr();
-                            auto buff = adp_push->get_empty_buffer(sout_id, swap_buff);
-                            contents->rebind_sockets[rebind_id][sout_id][1]->dataptr = buff;
-                            // the output socket linked to the push adp can have more than one socket bound and so
-                            // we have to rebind all the input sokects bound to the current output socket
-                            for (size_t ta = 2; ta < contents->rebind_sockets[rebind_id][sout_id].size(); ta++)
-                                contents->rebind_sockets[rebind_id][sout_id][ta]->dataptr = buff;
-                        }
-                        adp_push->wake_up_puller();
-                        return status;
-                    };
                 }
             }
 
-            contents->has_custom_processes = !modified_tasks.empty();
+            contents->has_custom_processes = !modified_custom_info.empty();
             for (auto task : contents->tasks)
-                if (modified_tasks.count(task))
-                {
+                if (modified_custom_info.count(task))
                     contents->custom_processes.push_back(modified_custom_info[task]);
-                    contents->processes.push_back(modified_tasks[task]);
-                }
                 else
-                {
                     contents->custom_processes.push_back({ process_t::STD, 0, nullptr });
-                    contents->processes.push_back(
-                      [task]() -> const int*
-                      {
-                          task->exec();
-                          const int* status = (const int*)task->sockets.back()->_get_dataptr();
-                          return status;
-                      });
-                }
 
             for (auto c : cur_node->get_children())
                 gen_processes_recursive(c, already_parsed_nodes);

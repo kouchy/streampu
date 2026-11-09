@@ -73,7 +73,6 @@ class Sub_sequence_generic
   public:
     subseq_t type;
     VTA tasks;
-    std::vector<std::function<const int*()>> processes;
     std::vector<size_t> tasks_id;
     size_t id;
 

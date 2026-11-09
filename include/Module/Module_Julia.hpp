@@ -17,7 +17,7 @@
 
 #include "Module/Module.hpp"
 #include "Runtime/Task/Task.hpp"
-#include "Tools/Julia/Proxy.hpp"
+#include "Tools/Julia/Julia.hpp"
 
 namespace spu
 {
@@ -63,6 +63,22 @@ class Module_Julia
      */
     struct Socket_jl_cache
     {
+        static constexpr size_t HT_SIZE = 128; // Power-of-2 direct-mapped L1 hash table size
+        struct Fast_slot
+        {
+            void* dataptr;
+            jl_value_t* jl_array;
+        };
+
+        // Folds cache-line-aligned bits (`u >> 6`, `u >> 13`, `u >> 20`) of the heap buffer pointer `p` into
+        // `[0, HT_SIZE - 1]` in 3 single-cycle bitwise ops without integer division (`%`). Because allocator slabs
+        // for 64-byte buffers step by `0x40` (`1 << 6`), `u >> 6` steps sequentially by 1 with zero collisions.
+        static inline size_t hash_dataptr(const void* p) noexcept
+        {
+            const uintptr_t u = reinterpret_cast<uintptr_t>(p);
+            return static_cast<size_t>(((u >> 6) ^ (u >> 13) ^ (u >> 20)) & (HT_SIZE - 1));
+        }
+
         const runtime::Socket* sck = nullptr;
         jl_value_t* array_type = nullptr; //!< Cached `Vector{T}` Julia `DataType` resolved once in `eval()`.
         void* last_dataptr =
@@ -70,7 +86,8 @@ class Module_Julia
         size_t n_elmts_per_wave = 0; //!< Precomputed element count per wave (`sck->get_n_elmts() * nfw / n_frames`).
         size_t last_hit_idx =
           0; //!< Index of the most recently matched entry in `entries` (for O(1) cyclic prediction).
-        size_t next_evict_idx = 0; //!< Round-robin (FIFO) replacement cursor when `entries.size() == max_entries`.
+        size_t next_evict_idx = 0;  //!< Round-robin (FIFO) replacement cursor when `entries.size() == max_entries`.
+        Fast_slot ht[HT_SIZE] = {}; //!< Direct-mapped L1 hash table mapping `dataptr -> jl_array` in O(1).
         struct Entry
         {
             void* dataptr;        //!< Wrapped C++ buffer base pointer.
@@ -176,6 +193,7 @@ class Module_Julia
     }
 
     static int slow_exec_codelet(Task_jl_cache* tcache, const size_t frame_id);
+    jl_value_t* get_or_create_socket_array(const size_t tid, const size_t s, void* p, const size_t n_elmts);
 
   protected:
     void deep_copy(const Module_Julia& m, Module* self_module);
@@ -195,8 +213,6 @@ class Module_Julia
 
     static size_t get_task_id(runtime::Task& task);
     static jl_value_t* get_jl_datatype(const runtime::Socket* sck);
-    static tools::Proxy jl_new_array_from_data(const runtime::Socket* sck, size_t n_elmts);
-    jl_value_t* get_or_create_socket_array(const size_t tid, const size_t s, void* p, const size_t n_elmts);
 
   private:
     // Compile-time arity specialization helpers using C++11 tag dispatch (std::true_type / std::false_type) so the

@@ -1,16 +1,9 @@
 #ifdef SPU_JULIA
 
-// When enabled, unsafe Julia codelets (`set_jl_safety(false)`) are compiled into a typed `@cfunction` native C
-// entry point and invoked directly via a C function pointer (`invoke_trampoline`), bypassing `jl_call`'s dynamic
-// multiple-dispatch lookup, GC frame push/pop, and `Int32` return boxing/unboxing (~20-25 ns saved per call).
-// Comment out this macro to fall back to `jl_call` in unsafe mode.
-#define SPU_JULIA_TRAMPOLINE
-
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <julia.h>
-#include <limits>
 #include <mutex>
 #include <sstream>
 #include <typeindex>
@@ -20,7 +13,6 @@
 #include "Runtime/Socket/Socket.hpp"
 #include "Tools/Exception/exception.hpp"
 #include "Tools/Julia/Julia.hpp"
-#include "Tools/Julia/Proxy.hpp"
 #include "Tools/Julia/Ref_keeper.hpp"
 
 using namespace spu;
@@ -59,35 +51,35 @@ Module_Julia::get_jl_datatype(const runtime::Socket* sck)
     }
 }
 
-tools::Proxy
-Module_Julia::jl_new_array_from_data(const runtime::Socket* sck, size_t n_elmts)
-{
-    void* p = (void*)sck->get_dataptr();
-    jl_value_t* datatype = Module_Julia::get_jl_datatype(sck);
-    tools::Proxy r = tools::Proxy((jl_value_t*)jl_ptr_to_array_1d(jl_apply_array_type(datatype, 1), p, n_elmts, 0));
-    return r;
-}
-
 jl_value_t*
 Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void* p, const size_t n_elmts)
 {
     auto& cache = this->get_task_cache(tid).sockets[s];
+    const size_t h = Socket_jl_cache::hash_dataptr(p);
+    if (cache.ht[h].dataptr == p && cache.n_elmts_per_wave == n_elmts)
+    {
+        cache.last_dataptr = p;
+        return cache.ht[h].jl_array;
+    }
+
     const size_t n_entries = cache.entries.size();
     if (n_entries > 0)
     {
         // 1. O(1) cyclic fast path: in multi-wave execution (`w = 0, 1, ..., W-1`) or Pipeline adaptor ring buffers,
-        //    consecutive calls step sequentially through `cache.entries`. Checking `(last_hit_idx + 1) % n_entries`
-        //    first resolves the lookup in a single comparison without scanning.
-        const size_t next_idx = (cache.last_hit_idx + 1) % n_entries;
+        //    consecutive calls step sequentially through `cache.entries`. Checking `last_hit_idx + 1` with a
+        //    branchless wrap-around (instead of `% n_entries` integer division) resolves cyclic lookups in O(1).
+        const size_t next_idx = (cache.last_hit_idx + 1 < n_entries) ? (cache.last_hit_idx + 1) : 0;
         const auto& next_entry = cache.entries[next_idx];
         if (next_entry.dataptr == p && next_entry.n_elmts == n_elmts)
         {
             cache.last_dataptr = p;
             cache.last_hit_idx = next_idx;
+            cache.ht[h] = { p, next_entry.jl_array };
             return next_entry.jl_array;
         }
 
-        // 2. Linear scan fallback across all cached entries for this socket.
+        // 2. Linear scan fallback across all cached entries for this socket (e.g. if two buffer addresses collided
+        //    in the direct-mapped `ht` table or arrived out of cyclic order).
         for (size_t i = 0; i < n_entries; i++)
         {
             const auto& entry = cache.entries[i];
@@ -95,6 +87,7 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
             {
                 cache.last_dataptr = p;
                 cache.last_hit_idx = i;
+                cache.ht[h] = { p, entry.jl_array };
                 return entry.jl_array;
             }
         }
@@ -110,6 +103,9 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
         auto& entry = cache.entries[i];
         if (entry.n_elmts != n_elmts)
         {
+            const size_t old_h = Socket_jl_cache::hash_dataptr(entry.dataptr);
+            if (cache.ht[old_h].dataptr == entry.dataptr) cache.ht[old_h] = { nullptr, nullptr };
+
             auto gc_state = jl_gc_enable(0);
             jl_value_t* jl_arr = (jl_value_t*)jl_ptr_to_array_1d(cache.array_type, p, n_elmts, 0);
             tools::Ref_keeper::get()->update_value(entry.jl_id, jl_arr);
@@ -120,14 +116,16 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
             entry.jl_array = jl_arr;
             cache.last_dataptr = p;
             cache.last_hit_idx = i;
+            cache.ht[h] = { p, jl_arr };
             return jl_arr;
         }
     }
 
     // 4. Cache miss: allocate a new 1D Julia `Array` wrapper (`own_buffer = 0`, so C++ retains ownership of `p`).
-    //    Scale `max_entries` with `get_n_waves()` so multi-wave tasks coupled to Pipeline ring buffers never thrash,
-    //    and use round-robin (FIFO) eviction via `update_value()` if `max_entries` is ever reached.
-    const size_t max_entries = std::max<size_t>(64, this->self_module->get_n_waves() * 16);
+    //    Use a base capacity of 256 entries (scaling with `get_n_waves() * 64`) so even large Pipeline adaptor ring
+    //    buffers (e.g., `buffer_size = 64`, which circulates `64 + 2 = 66` distinct buffers) never thrash the FIFO
+    //    cache.
+    const size_t max_entries = std::max<size_t>(256, this->self_module->get_n_waves() * 64);
     auto gc_state = jl_gc_enable(0);
     jl_value_t* jl_arr = (jl_value_t*)jl_ptr_to_array_1d(cache.array_type, p, n_elmts, 0);
     if (n_entries < max_entries)
@@ -139,9 +137,11 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
     }
     else
     {
-        const size_t evict_idx = cache.next_evict_idx % max_entries;
-        cache.next_evict_idx = (evict_idx + 1) % max_entries;
+        const size_t evict_idx = (cache.next_evict_idx < max_entries) ? cache.next_evict_idx : 0;
+        cache.next_evict_idx = (evict_idx + 1 < max_entries) ? (evict_idx + 1) : 0;
         auto& victim = cache.entries[evict_idx];
+        const size_t old_h = Socket_jl_cache::hash_dataptr(victim.dataptr);
+        if (cache.ht[old_h].dataptr == victim.dataptr) cache.ht[old_h] = { nullptr, nullptr };
         tools::Ref_keeper::get()->update_value(victim.jl_id, jl_arr);
         victim.dataptr = p;
         victim.n_elmts = n_elmts;
@@ -151,6 +151,7 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
     jl_gc_enable(gc_state);
 
     cache.last_dataptr = p;
+    cache.ht[h] = { p, jl_arr };
     return jl_arr;
 }
 
@@ -539,13 +540,6 @@ Module_Julia::create_cdl_function(runtime::Task& task, jl_function_t* f)
 #define SPU_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #endif
 
-#ifdef SPU_JULIA_TRAMPOLINE
-// Maximum number of Julia object arguments (states + sockets + constants) unpacked directly into C ABI arguments
-// (`a[0], a[1], ..., a[K], frame_id, n_frames_per_wave`) via C++11 variadic templates.
-// Above 16 object arguments, `_spu_make_trampoline` automatically emits a two-stage trampoline (`_spu_trampoline_outer`
-// -> `ccall` -> `_spu_trampoline_inner`) accepting `func_args.data()` (`void* const*`) as a single pointer argument.
-static constexpr size_t SPU_MAX_DIRECT_TRAMPOLINE_ARGS = 16;
-
 // C++11 compile-time integer sequence (`std::index_sequence` equivalent, which was only introduced in C++14)
 // used to unpack `a[0], a[1], ..., a[K]` into a typed C function pointer call.
 template<size_t... Is>
@@ -579,7 +573,7 @@ call_trampoline_n(void* cfunc, void* const* a, const uint32_t fid, const uint32_
 // Base case (`n_obj_args > SPU_MAX_DIRECT_TRAMPOLINE_ARGS`): invokes the outer `@cfunction` trampoline by passing
 // the base address of `func_args` (`void* const* a`) alongside `fid` and `nfw`.
 template<size_t I>
-static inline typename std::enable_if<(I > SPU_MAX_DIRECT_TRAMPOLINE_ARGS), int32_t>::type
+static inline typename std::enable_if<(I > Module_Julia::SPU_MAX_DIRECT_TRAMPOLINE_ARGS), int32_t>::type
 invoke_trampoline(void* cfunc, void* const* a, const uint32_t fid, const uint32_t nfw, const size_t /*n_obj_args*/)
 {
     return ((int32_t(*)(void* const*, uint32_t, uint32_t))cfunc)(a, fid, nfw);
@@ -589,7 +583,7 @@ invoke_trampoline(void* cfunc, void* const* a, const uint32_t fid, const uint32_
 // Compiles down to a dense jump table where each branch invokes `cfunc` with the exact arity `I + 1`
 // (`a[0]` for `f`, plus `a[1..I]` for the `I` object arguments).
 template<size_t I = 0>
-static inline typename std::enable_if<(I <= SPU_MAX_DIRECT_TRAMPOLINE_ARGS), int32_t>::type
+static inline typename std::enable_if<(I <= Module_Julia::SPU_MAX_DIRECT_TRAMPOLINE_ARGS), int32_t>::type
 invoke_trampoline(void* cfunc, void* const* a, const uint32_t fid, const uint32_t nfw, const size_t n_obj_args)
 {
     if (n_obj_args == I) return call_trampoline_n(cfunc, a, fid, nfw, Make_index_seq<I + 1>{});
@@ -761,7 +755,7 @@ end
         make_trampoline_fn = jl_get_function(jl_main_module, "_spu_make_trampoline");
     }
 
-    const size_t n_types = func_args.size() - 2;
+    const size_t n_types = func_args.size();
     void* out_ptrs[2] = { nullptr, nullptr };
     (void)jl_call3(make_trampoline_fn,
                    jl_box_voidpointer((void*)func_args.data()),
@@ -778,7 +772,6 @@ end
     out_unsafe_cfunc = out_ptrs[0];
     out_safe_cfunc = out_ptrs[1];
 }
-#endif
 
 SPU_NOINLINE int
 Module_Julia::slow_exec_codelet(Task_jl_cache* tcache, const size_t frame_id)
@@ -809,6 +802,8 @@ Module_Julia::slow_exec_codelet(Task_jl_cache* tcache, const size_t frame_id)
             {
                 cache.n_elmts_per_wave = new_n_elmts;
                 cache.last_dataptr = nullptr;
+                for (size_t h = 0; h < Socket_jl_cache::HT_SIZE; h++)
+                    cache.ht[h] = { nullptr, nullptr };
                 if (s < SPU_MAX_FAST_SOCKETS) tcache->fast_scks[s].last_dataptr = nullptr;
             }
         }
@@ -825,7 +820,6 @@ Module_Julia::slow_exec_codelet(Task_jl_cache* tcache, const size_t frame_id)
         }
     }
 
-#ifdef SPU_JULIA_TRAMPOLINE
     if (tcache->unsafe_cfunc == nullptr)
     {
         auto& shared = *tcache->shared_trampoline;
@@ -877,45 +871,48 @@ Module_Julia::slow_exec_codelet(Task_jl_cache* tcache, const size_t frame_id)
         return invoke_safe_trampoline(tcache->safe_cfunc, func_args, (uint32_t)frame_id, (uint32_t)n_frames_per_wave);
     return invoke_trampoline(
       tcache->unsafe_cfunc, func_args, (uint32_t)frame_id, (uint32_t)n_frames_per_wave, tcache->n_obj_args);
-#else
-    auto& func_args_vec = tcache->func_args;
-    *(uint32_t*)func_args[func_args_vec.size() - 2] = (uint32_t)frame_id;
-    *(uint32_t*)func_args[func_args_vec.size() - 1] = (uint32_t)n_frames_per_wave;
-
-    auto& shared = *tcache->shared_trampoline;
-    if (!shared.compiled.load(std::memory_order_acquire))
-    {
-        static std::mutex compile_mtx;
-        int8_t prev_gc_state = 0;
-        const bool can_safe = (jl_get_pgcstack() != nullptr);
-        if (can_safe) prev_gc_state = jl_gc_safe_enter(jl_current_task->ptls);
-
-        std::unique_lock<std::mutex> lock(compile_mtx);
-
-        if (can_safe) jl_gc_safe_leave(jl_current_task->ptls, prev_gc_state);
-
-        if (!shared.compiled.load(std::memory_order_relaxed))
-        {
-            jl_value_t* res = sjl.is_jl_safe() ? tools::Julia::call(func_args_vec, true)
-                                               : jl_call((jl_function_t*)func_args[0],
-                                                         (jl_value_t**)&func_args[1],
-                                                         (uint32_t)(func_args_vec.size() - 1));
-            shared.compiled.store(true, std::memory_order_release);
-            return jl_unbox_int32(res);
-        }
-    }
-
-    jl_value_t* res =
-      sjl.is_jl_safe()
-        ? tools::Julia::call(func_args_vec, true)
-        : jl_call((jl_function_t*)func_args[0], (jl_value_t**)&func_args[1], (uint32_t)(func_args_vec.size() - 1));
-    return jl_unbox_int32(res);
-#endif
 }
 
-#ifdef SPU_JULIA_TRAMPOLINE
+// Inline zero-copy / multi-wave socket rebinding helpers for `exec_codelet_fixed<N_SCKS, N_OBJ_ARGS>`:
+// In a `Pipeline` with `no_copy=true` (where `Adaptor_m_to_n` swaps socket `dataptr` pointers on every frame) or in
+// multi-wave execution, `diff_fast_sockets<N_SCKS>(tcache)` is non-zero on every frame/wave. Instead of bailing out to
+// the out-of-line `slow_exec_codelet()` (which loses the compile-time arity `N_OBJ_ARGS`), `rebind_fast_sockets`
+// resolves the `jl_array_t*` wrapper for each changed socket in O(1) via the direct-mapped L1 hash table `cache.ht`
+// and proceeds directly to `call_trampoline_n`.
+template<size_t I>
+static inline void
+rebind_fast_socket_at(Module_Julia::Task_jl_cache* tcache)
+{
+    void* p = const_cast<void*>(static_cast<const void*>(tcache->fast_scks[I].sck->get_dataptr<const uint8_t>()));
+    if (tcache->fast_scks[I].last_dataptr != p)
+    {
+        tcache->fast_scks[I].last_dataptr = p;
+        auto& cache = tcache->sockets[I];
+        const size_t h = Module_Julia::Socket_jl_cache::hash_dataptr(p);
+        jl_value_t* jl_arr = (cache.ht[h].dataptr == p)
+                               ? cache.ht[h].jl_array
+                               : tcache->owner->get_or_create_socket_array(tcache->tid, I, p, cache.n_elmts_per_wave);
+        cache.last_dataptr = p;
+        tcache->func_args_ptr[tcache->first_sck_arg + I] = (void*)jl_arr;
+    }
+}
+
+template<size_t N_SCKS>
+static inline void
+rebind_fast_sockets(Module_Julia::Task_jl_cache* tcache)
+{
+    rebind_fast_sockets<N_SCKS - 1>(tcache);
+    rebind_fast_socket_at<N_SCKS - 1>(tcache);
+}
+
+template<>
+inline void
+rebind_fast_sockets<0>(Module_Julia::Task_jl_cache* /*tcache*/)
+{
+}
+
 // Fast-path codelet execution template specialized at `create_codelet()` time for the exact socket count `N_SCKS`
-// (`0..4`) and exact object argument count `N_OBJ_ARGS` (`N_SCKS..16`).
+// (`0..8`) and exact object argument count `N_OBJ_ARGS` (`N_SCKS..16`).
 // All three exit paths (`slow_exec_codelet`, `invoke_safe_trampoline`, and `call_trampoline_n`) are tail calls
 // with zero local stack objects or destructors, allowing the compiler to omit the stack frame prologue/epilogue
 // (`stp`/`ldp`) and tail-jump (`br`) directly into the Julia `@cfunction`.
@@ -925,10 +922,13 @@ exec_codelet_fixed(Module_Julia::Task_jl_cache* tcache, module::Module& m, const
 {
     const size_t n_frames = m.Module::get_n_frames();
     const size_t n_frames_per_wave = m.get_n_frames_per_wave();
-    if (SPU_UNLIKELY(((tcache->last_n_frames ^ n_frames) | (tcache->last_n_frames_per_wave ^ n_frames_per_wave) |
-                      diff_fast_sockets<N_SCKS>(tcache)) != 0))
+    if (SPU_UNLIKELY(((tcache->last_n_frames ^ n_frames) | (tcache->last_n_frames_per_wave ^ n_frames_per_wave)) != 0))
     {
         return Module_Julia::slow_exec_codelet(tcache, frame_id);
+    }
+    if (diff_fast_sockets<N_SCKS>(tcache) != 0)
+    {
+        rebind_fast_sockets<N_SCKS>(tcache);
     }
     if (SPU_UNLIKELY(tcache->jl_safe))
     {
@@ -985,7 +985,6 @@ Module_Julia::bind_fast_codelet_arity(runtime::Task& task,
     this->bind_fast_codelet_arity<N_SCKS, I + 1>(
       task, tcache_offset, expected_n_obj_args, std::integral_constant<bool, next_in_range>());
 }
-#endif
 
 void
 Module_Julia::_create_codelet(runtime::Task& task, const std::string& julia_function_name)
@@ -1010,7 +1009,6 @@ Module_Julia::_create_codelet(runtime::Task& task, const std::string& julia_func
         init_tcache.fast_scks[s].last_dataptr = nullptr;
     }
 
-#ifdef SPU_JULIA_TRAMPOLINE
     if (tid < SPU_MAX_INLINE_TASKS && n_scks <= SPU_MAX_FAST_SOCKETS &&
         expected_n_obj_args <= SPU_MAX_DIRECT_TRAMPOLINE_ARGS)
     {
@@ -1050,7 +1048,6 @@ Module_Julia::_create_codelet(runtime::Task& task, const std::string& julia_func
         }
     }
     else
-#endif
     {
         const ptrdiff_t jl_offset =
           reinterpret_cast<const char*>(this) - reinterpret_cast<const char*>(this->self_module);
@@ -1087,19 +1084,15 @@ Module_Julia::_create_codelet(runtime::Task& task, const std::string& julia_func
           tcache.first_sck_arg = 1 + n_states;
           tcache.n_obj_args = n_obj_args;
           tcache.expected_n_obj_args = expected_n_obj_args;
-#ifdef SPU_JULIA_TRAMPOLINE
           tcache.fixed_arity_valid =
             (tid < SPU_MAX_INLINE_TASKS && n_scks <= SPU_MAX_FAST_SOCKETS &&
              n_obj_args <= SPU_MAX_DIRECT_TRAMPOLINE_ARGS && n_obj_args == expected_n_obj_args);
-#else
-          tcache.fixed_arity_valid = false;
-#endif
           tcache.shared_trampoline = shared_trampoline;
           tcache.jl_safe = m.jl_safe;
           tcache.last_n_frames = 0;
           tcache.last_n_frames_per_wave = 0;
 
-          tcache.func_args.resize(1 + n_states + task.sockets.size() + n_csts + 1);
+          tcache.func_args.resize(1 + n_obj_args);
           tcache.func_args_ptr = tcache.func_args.data();
           tcache.sockets.resize(n_scks);
 
@@ -1163,23 +1156,7 @@ Module_Julia::_create_codelet(runtime::Task& task, const std::string& julia_func
           }
 
           for (size_t i = 0; i < n_csts; i++)
-              tcache.func_args[tcache.func_args.size() - (n_csts + 2) + i] = (void*)m.jl_constants_ptr[tid][i];
-
-          // Allocate dedicated heap-backed UInt32 boxes (passing a value >= 1024 bypasses Julia's
-          // global box_uint32_cache[0..1023] singletons, which must never be mutated in-place).
-          jl_value_t* jl_frame_id = jl_box_uint32(std::numeric_limits<uint32_t>::max());
-          *(uint32_t*)jl_frame_id = 0;
-          size_t jl_frame_id_id = tools::Julia::preserve(jl_frame_id);
-          m.jl_constants_ptr[tid].push_back(jl_frame_id);
-          m.jl_constants_id[tid].push_back(jl_frame_id_id);
-          tcache.func_args[tcache.func_args.size() - 2] = (void*)jl_frame_id;
-
-          jl_value_t* jl_n_frames_per_wave = jl_box_uint32(std::numeric_limits<uint32_t>::max());
-          *(uint32_t*)jl_n_frames_per_wave = (uint32_t)m.self_module->get_n_frames_per_wave();
-          size_t jl_n_frames_per_wave_id = tools::Julia::preserve(jl_n_frames_per_wave);
-          m.jl_constants_ptr[tid].push_back(jl_n_frames_per_wave);
-          m.jl_constants_id[tid].push_back(jl_n_frames_per_wave_id);
-          tcache.func_args[tcache.func_args.size() - 1] = (void*)jl_n_frames_per_wave;
+              tcache.func_args[1 + n_states + n_scks + i] = (void*)m.jl_constants_ptr[tid][i];
       });
 }
 

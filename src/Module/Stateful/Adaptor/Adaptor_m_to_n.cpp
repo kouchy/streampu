@@ -38,6 +38,7 @@ Adaptor_m_to_n::deep_copy(const Adaptor_m_to_n& m)
 
     this->cloned = true;
     (*this->n_clones)++;
+    this->channels_ptr = this->channels->data();
     this->tid_push = -1;
     this->tid_pull = -1;
     this->cur_push_id = -1;
@@ -75,8 +76,8 @@ Adaptor_m_to_n::alloc_buffers()
         throw tools::invalid_argument(__FILE__, __LINE__, __func__, message.str());
     }
 
-    this->buffer->resize(ppcm,
-                         std::vector<std::vector<int8_t*>>(this->n_sockets, std::vector<int8_t*>(this->buffer_size)));
+    const size_t stride = this->buffer_size * this->n_sockets;
+    this->buffer->resize(ppcm * stride, nullptr);
     this->ts_buffer->resize(ppcm, std::vector<uint64_t>(this->buffer_size, 0));
 
     if (this->buffer_to_free.size())
@@ -86,16 +87,23 @@ Adaptor_m_to_n::alloc_buffers()
         throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
     }
 
-    // this->buffer_to_free.clear();
     for (size_t d = 0; d < ppcm; d++)
     {
-        for (size_t s = 0; s < this->n_sockets; s++)
-            for (size_t b = 0; b < this->buffer_size; b++)
+        for (size_t b = 0; b < this->buffer_size; b++)
+            for (size_t s = 0; s < this->n_sockets; s++)
             {
-                (*this->buffer)[d][s][b] = new int8_t[this->n_frames * this->n_bytes[s]];
-                this->buffer_to_free.push_back((*this->buffer)[d][s][b]);
+                int8_t* ptr = new int8_t[this->n_frames * this->n_bytes[s]];
+                (*this->buffer)[(d * this->buffer_size + b) * this->n_sockets + s] = ptr;
+                this->buffer_to_free.push_back(ptr);
             }
-        (*this->channels)[d].reset();
+        auto& ch = this->channels_ptr[d];
+        ch.reset();
+        ch.push_slots_base = &(*this->buffer)[d * stride];
+        ch.pull_slots_base = &(*this->buffer)[d * stride];
+        ch.push_ts_base = (*this->ts_buffer)[d].data();
+        ch.pull_ts_base = (*this->ts_buffer)[d].data();
+        ch.push_n_channels = static_cast<uint32_t>(ppcm);
+        ch.pull_n_channels = static_cast<uint32_t>(ppcm);
     }
 
     *this->buffers_allocated = true;
@@ -145,9 +153,10 @@ Adaptor_m_to_n::reset()
     if (!this->cloned)
     {
         this->waiting_canceled->store(false, std::memory_order_relaxed);
-        for (size_t d = 0; d < this->buffer->size(); d++)
+        const size_t n_ch = this->channels_ptr[0].push_n_channels;
+        for (size_t d = 0; d < n_ch; d++)
         {
-            (*this->channels)[d].reset();
+            this->channels_ptr[d].reset();
         }
     }
     this->cur_push_id = (size_t)this->tid_push;
@@ -172,11 +181,8 @@ Adaptor_m_to_n::reset_buffer()
 {
     if (!this->cloned && *this->buffers_allocated)
     {
-        size_t id_buff = 0;
-        for (size_t d = 0; d < (*this->buffer).size(); d++)
-            for (size_t s = 0; s < this->n_sockets; s++)
-                for (size_t b = 0; b < this->buffer_size; b++)
-                    (*this->buffer)[d][s][b] = this->buffer_to_free[id_buff++];
+        for (size_t i = 0; i < this->buffer_to_free.size(); i++)
+            (*this->buffer)[i] = this->buffer_to_free[i];
     }
 }
 
@@ -187,76 +193,40 @@ Adaptor_m_to_n::set_n_frames(const size_t n_frames)
     if (old_n_frames != n_frames)
     {
         Module::set_n_frames(n_frames);
-        if (!this->cloned)
+        if (!this->cloned && *this->buffers_allocated)
         {
-            if (*this->buffers_allocated)
-            {
-                for (size_t d = 0; d < (*this->buffer).size(); d++)
-                {
-                    for (size_t s = 0; s < (*this->buffer)[d].size(); s++)
+            const size_t n_ch = this->channels_ptr[0].push_n_channels;
+            for (size_t d = 0; d < n_ch; d++)
+                for (size_t b = 0; b < this->buffer_size; b++)
+                    for (size_t s = 0; s < this->n_sockets; s++)
                     {
-                        for (size_t b = 0; b < (*this->buffer)[d][s].size(); b++)
-                        {
-                            auto old_ptr = (*this->buffer)[d][s][b];
-                            (*this->buffer)[d][s][b] = new int8_t[this->n_bytes[s] * n_frames];
+                        const size_t idx = (d * this->buffer_size + b) * this->n_sockets + s;
+                        auto old_ptr = (*this->buffer)[idx];
+                        int8_t* new_ptr = new int8_t[this->n_bytes[s] * n_frames];
+                        (*this->buffer)[idx] = new_ptr;
 
-                            bool found = false;
-                            for (size_t bf = 0; bf < this->buffer_to_free.size(); bf++)
-                                if (this->buffer_to_free[bf] == old_ptr)
-                                {
-                                    delete[] this->buffer_to_free[bf];
-                                    this->buffer_to_free[bf] = (*this->buffer)[d][s][b];
-                                    found = true;
-                                    break;
-                                }
-
-                            if (found == false)
+                        bool found = false;
+                        for (size_t bf = 0; bf < this->buffer_to_free.size(); bf++)
+                            if (this->buffer_to_free[bf] == old_ptr)
                             {
-                                std::stringstream message;
-                                message << "This should never happen.";
-                                throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
+                                delete[] this->buffer_to_free[bf];
+                                this->buffer_to_free[bf] = new_ptr;
+                                found = true;
+                                break;
                             }
+
+                        if (found == false)
+                        {
+                            std::stringstream message;
+                            message << "This should never happen.";
+                            throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
                         }
                     }
-                }
-            }
         }
     }
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-
-void
-Adaptor_m_to_n::push(const std::vector<const int8_t*>& in, const size_t /*frame_id*/)
-{
-    this->wait_push();
-
-    for (size_t s = 0; s < this->n_sockets; s++)
-    {
-        int8_t* out = (int8_t*)this->get_empty_buffer(s);
-
-        std::copy(
-          in[s] + 0 * this->n_bytes[s], in[s] + this->get_n_frames() * this->n_bytes[s], out + 0 * this->n_bytes[s]);
-    }
-
-    this->wake_up_puller();
-}
-
-void
-Adaptor_m_to_n::pull(const std::vector<int8_t*>& out, const size_t /*frame_id*/)
-{
-    this->wait_pull();
-
-    for (size_t s = 0; s < this->n_sockets; s++)
-    {
-        const int8_t* in = (const int8_t*)this->get_filled_buffer(s);
-
-        std::copy(
-          in + 0 * this->n_bytes[s], in + this->get_n_frames() * this->n_bytes[s], out[s] + 0 * this->n_bytes[s]);
-    }
-
-    this->wake_up_pusher();
-}
 
 void
 Adaptor_m_to_n::push(const runtime::Task& t, const size_t base_sck, const size_t /*frame_id*/)
@@ -447,9 +417,9 @@ Adaptor_m_to_n::wait_pull()
     // timestamp from the shared ring buffer slot before `wake_up_pusher()` releases the slot.
     if (this->pull_stage_start_ts_ptr != nullptr)
     {
+        const auto& ch = this->channels_ptr[this->cur_pull_id];
         *this->pull_stage_start_ts_ptr = tools::read_tsc();
-        *this->pull_birth_ts_ptr =
-          (*this->ts_buffer)[this->cur_pull_id][(*this->channels)[this->cur_pull_id].read_slot];
+        *this->pull_birth_ts_ptr = ch.pull_ts_base[ch.read_slot];
     }
 }
 
@@ -466,12 +436,13 @@ Adaptor_m_to_n::wake_up()
 {
     if (!this->active_waiting) // passive waiting
     {
-        for (size_t i = 0; i < this->buffer->size(); i++)
+        const size_t n_ch = this->channels_ptr[0].push_n_channels;
+        for (size_t i = 0; i < n_ch; i++)
         {
             std::unique_lock<std::mutex> lock((*this->mtx_push.get())[i]);
             (*this->cnd_push.get())[i].notify_all();
         }
-        for (size_t i = 0; i < this->buffer->size(); i++)
+        for (size_t i = 0; i < n_ch; i++)
         {
             std::unique_lock<std::mutex> lock((*this->mtx_pull.get())[i]);
             (*this->cnd_pull.get())[i].notify_all();

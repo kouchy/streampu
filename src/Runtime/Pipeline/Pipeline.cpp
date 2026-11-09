@@ -1065,13 +1065,6 @@ Pipeline::_bind_adaptors(const bool bind_adaptors)
                     auto ss = this->stages[sta]->sequences[t]->get_contents();
                     assert(ss != nullptr);
                     ss->tasks.insert(ss->tasks.begin(), task_pull);
-                    ss->processes.insert(ss->processes.begin(),
-                                         [task_pull]() -> const int*
-                                         {
-                                             task_pull->exec();
-                                             const int* status = task_pull->sockets.back()->get_dataptr<const int>();
-                                             return status;
-                                         });
                     this->stages[sta]->update_tasks_id(t);
                 }
                 this->stages[sta]->firsts_tasks_id.clear();
@@ -1097,13 +1090,6 @@ Pipeline::_bind_adaptors(const bool bind_adaptors)
                     auto ss = this->stages[sta]->get_last_subsequence(t);
                     assert(ss != nullptr);
                     ss->tasks.push_back(task_push);
-                    ss->processes.push_back(
-                      [task_push]() -> const int*
-                      {
-                          task_push->exec();
-                          const int* status = task_push->sockets.back()->get_dataptr<const int>();
-                          return status;
-                      });
                     last_task_id = ss->tasks_id[ss->tasks_id.size() - 1] + 1;
                     ss->tasks_id.push_back(last_task_id);
                 }
@@ -1181,7 +1167,6 @@ Pipeline::_unbind_adaptors(const bool bind_orphans)
                     auto ss = this->stages[sta]->sequences[t]->get_contents();
                     assert(ss != nullptr);
                     ss->tasks.erase(ss->tasks.begin());
-                    ss->processes.erase(ss->processes.begin());
                     this->stages[sta]->update_tasks_id(t);
                 }
                 this->stages[sta]->firsts_tasks_id = this->saved_firsts_tasks_id[sta];
@@ -1201,7 +1186,6 @@ Pipeline::_unbind_adaptors(const bool bind_orphans)
                     auto ss = this->stages[sta]->get_last_subsequence(t);
                     assert(ss != nullptr);
                     ss->tasks.pop_back();
-                    ss->processes.pop_back();
                     ss->tasks_id.pop_back();
                 }
                 this->stages[sta]->lasts_tasks_id = this->saved_lasts_tasks_id[sta];

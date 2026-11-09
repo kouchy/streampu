@@ -21,10 +21,9 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
   , datatype(datatype)
   , buffer_size(buffer_size)
   , n_sockets(n_elmts.size())
-  , buffer(new std::vector<std::vector<std::vector<int8_t*>>>(
-      1,
-      std::vector<std::vector<int8_t*>>(n_sockets, std::vector<int8_t*>(buffer_size))))
+  , buffer(new std::vector<int8_t*>(n_sockets * buffer_size, nullptr))
   , channels(new std::vector<SPSC_channel_sync>(1000))
+  , channels_ptr(this->channels->data())
   , waiting_canceled(new std::atomic<bool>(false))
   , no_copy_pull(false)
   , no_copy_push(false)
@@ -77,6 +76,13 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
         }
     }
 
+    this->channels_ptr[0].push_slots_base = this->buffer->data();
+    this->channels_ptr[0].pull_slots_base = this->buffer->data();
+    this->channels_ptr[0].push_ts_base = (*this->ts_buffer)[0].data();
+    this->channels_ptr[0].pull_ts_base = (*this->ts_buffer)[0].data();
+    this->channels_ptr[0].push_n_channels = 1;
+    this->channels_ptr[0].pull_n_channels = 1;
+
     this->init();
 }
 
@@ -116,12 +122,13 @@ Adaptor_m_to_n::init()
                              if (adp.is_no_copy_push())
                              {
                                  adp.wait_push();
-                                 // Update `push` input socket pointers (`rebind_sockets[rebind_id][s][0]`):
-                                 // `Sequence::apply_custom_process_rebind()` rebinds indices `[1..N]` after this
-                                 // codelet returns, relying on `[0]` being updated here (critical when `adp_pull` and
-                                 // `adp_push` are directly connected or linked via `SFWD` sockets in the same stage).
-                                 for (size_t s = 0; s < n_scks; s++)
-                                     t.sockets[p1s_in0 + s]->dataptr = adp.get_empty_buffer(s);
+                                 // In fast mode (`t.is_fast()`), `Sequence::apply_custom_process_rebind()` updates
+                                 // both `t.sockets[s]->dataptr` (`rebind_sockets[rebind_id][s][0]`) and all upstream
+                                 // bound sockets (`[1..N]`) in a single pass via `get_empty_buffer(s, swap_buff)`.
+                                 // We only update `t.sockets[s]->dataptr` here when `!t.is_fast()` (e.g. debug mode).
+                                 if (SPU_TASK_UNLIKELY(!t.is_fast()))
+                                     for (size_t s = 0; s < n_scks; s++)
+                                         t.sockets[p1s_in0 + s]->dataptr = adp.get_empty_buffer(s);
                              }
                              else
                              {
@@ -143,11 +150,14 @@ Adaptor_m_to_n::init()
                              if (adp.is_no_copy_pull())
                              {
                                  adp.wait_pull();
-                                 // Update `pull` output socket pointers (`rebind_sockets[rebind_id][s][0]`) directly
-                                 // via `dataptr` (bypassing `_bind()` overhead) before `apply_custom_process_rebind()`
-                                 // swaps indices `[1..N]`.
-                                 for (size_t s = 0; s < n_scks; s++)
-                                     t.sockets[p2s_out0 + s]->dataptr = adp.get_filled_buffer(s);
+                                 // In fast mode (`t.is_fast()`), `Sequence::apply_custom_process_rebind()` updates
+                                 // both `t.sockets[s]->dataptr` (`rebind_sockets[rebind_id][s][0]`) and all downstream
+                                 // bound sockets (`[1..N]`) in a single pass via `get_filled_buffer(s, swap_buff)`.
+                                 // We only update `t.sockets[s]->dataptr` here when `!t.is_fast()` so `Task::_exec()`
+                                 // sees the new output pointer before printing debug socket contents.
+                                 if (SPU_TASK_UNLIKELY(!t.is_fast()))
+                                     for (size_t s = 0; s < n_scks; s++)
+                                         t.sockets[p2s_out0 + s]->dataptr = adp.get_filled_buffer(s);
                              }
                              else
                              {
@@ -178,25 +188,25 @@ Adaptor_m_to_n::get_datatype(const size_t sid) const
 bool
 Adaptor_m_to_n::is_empty(const size_t id)
 {
-    return (*this->channels)[id].is_empty();
+    return this->channels_ptr[id].is_empty();
 }
 
 bool
 Adaptor_m_to_n::is_full(const size_t id)
 {
-    return (*this->channels)[id].is_full(this->buffer_size);
+    return this->channels_ptr[id].is_full(this->buffer_size);
 }
 
 size_t
 Adaptor_m_to_n::n_fill_slots(const size_t id)
 {
-    return (*this->channels)[id].n_fill_slots(this->buffer_size);
+    return this->channels_ptr[id].n_fill_slots(this->buffer_size);
 }
 
 size_t
 Adaptor_m_to_n::n_free_slots(const size_t id)
 {
-    return (*this->channels)[id].n_free_slots(this->buffer_size);
+    return this->channels_ptr[id].n_free_slots(this->buffer_size);
 }
 
 bool
@@ -217,7 +227,8 @@ Adaptor_m_to_n::get_empty_buffer(const size_t sid)
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_empty_buffer()");
 #endif
-    return (void*)(*this->buffer)[this->cur_push_id][sid][(*this->channels)[this->cur_push_id].write_slot];
+    const auto& ch = this->channels_ptr[this->cur_push_id];
+    return (void*)ch.push_slots_base[ch.write_slot * this->n_sockets + sid];
 }
 
 void*
@@ -226,7 +237,8 @@ Adaptor_m_to_n::get_filled_buffer(const size_t sid)
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_filled_buffer()");
 #endif
-    return (void*)(*this->buffer)[this->cur_pull_id][sid][(*this->channels)[this->cur_pull_id].read_slot];
+    const auto& ch = this->channels_ptr[this->cur_pull_id];
+    return (void*)ch.pull_slots_base[ch.read_slot * this->n_sockets + sid];
 }
 
 void*
@@ -235,8 +247,8 @@ Adaptor_m_to_n::get_empty_buffer(const size_t sid, void* swap_buffer)
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_empty_buffer()");
 #endif
-    const uint32_t slot = (*this->channels)[this->cur_push_id].write_slot;
-    auto& slot_ref = (*this->buffer)[this->cur_push_id][sid][slot];
+    const auto& ch = this->channels_ptr[this->cur_push_id];
+    int8_t*& slot_ref = ch.push_slots_base[ch.write_slot * this->n_sockets + sid];
     void* empty_buffer = (void*)slot_ref;
     slot_ref = (int8_t*)swap_buffer;
     return empty_buffer;
@@ -248,8 +260,8 @@ Adaptor_m_to_n::get_filled_buffer(const size_t sid, void* swap_buffer)
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_filled_buffer()");
 #endif
-    const uint32_t slot = (*this->channels)[this->cur_pull_id].read_slot;
-    auto& slot_ref = (*this->buffer)[this->cur_pull_id][sid][slot];
+    const auto& ch = this->channels_ptr[this->cur_pull_id];
+    int8_t*& slot_ref = ch.pull_slots_base[ch.read_slot * this->n_sockets + sid];
     void* filled_buffer = (void*)slot_ref;
     slot_ref = (int8_t*)swap_buffer;
     return filled_buffer;
@@ -258,11 +270,10 @@ Adaptor_m_to_n::get_filled_buffer(const size_t sid, void* swap_buffer)
 void
 Adaptor_m_to_n::wake_up_puller()
 {
-    auto& ch = (*this->channels)[this->cur_push_id];
+    auto& ch = this->channels_ptr[this->cur_push_id];
     // Forward the current frame's birth timestamp into the ring buffer slot before `publish_push()` publishes the slot
     // to the downstream puller thread (works identically in both `copy` and `no_copy` modes).
-    if (this->push_birth_ts_ptr != nullptr)
-        (*this->ts_buffer)[this->cur_push_id][ch.write_slot] = *this->push_birth_ts_ptr;
+    if (this->push_birth_ts_ptr != nullptr) ch.push_ts_base[ch.write_slot] = *this->push_birth_ts_ptr;
 
     ch.publish_push(this->buffer_size);
 
@@ -276,8 +287,8 @@ Adaptor_m_to_n::wake_up_puller()
     }
 
     // Fast round-robin channel advancement without 64-bit integer modulo (`%`):
-    // In 1-to-1 stages (`n_ch == 1`), `cur_push_id` remains 0 without touching `n_pushers`.
-    const size_t n_ch = this->buffer->size();
+    // `ch.push_n_channels` resides on the Pusher's own cache line, avoiding a `this->buffer->size()` indirection.
+    const size_t n_ch = ch.push_n_channels;
     if (n_ch > 1)
     {
         const size_t next_id = this->cur_push_id + *this->n_pushers;
@@ -288,7 +299,7 @@ Adaptor_m_to_n::wake_up_puller()
 void
 Adaptor_m_to_n::wake_up_pusher()
 {
-    auto& ch = (*this->channels)[this->cur_pull_id];
+    auto& ch = this->channels_ptr[this->cur_pull_id];
     ch.publish_pull(this->buffer_size);
 
     if (!this->active_waiting) // passive waiting
@@ -301,8 +312,8 @@ Adaptor_m_to_n::wake_up_pusher()
     }
 
     // Fast round-robin channel advancement without 64-bit integer modulo (`%`):
-    // In 1-to-1 stages (`n_ch == 1`), `cur_pull_id` remains 0 without touching `n_pullers`.
-    const size_t n_ch = this->buffer->size();
+    // `ch.pull_n_channels` resides on the Puller's own cache line, avoiding a `this->buffer->size()` indirection.
+    const size_t n_ch = ch.pull_n_channels;
     if (n_ch > 1)
     {
         const size_t next_id = this->cur_pull_id + *this->n_pullers;
