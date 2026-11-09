@@ -13,7 +13,8 @@ mem_alloc_aligned(std::size_t alignment, std::size_t size)
 {
     void* ptr = nullptr;
 #if __cplusplus >= 201703L
-    ptr = std::aligned_alloc(alignment, size);
+    const std::size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+    ptr = std::aligned_alloc(alignment, aligned_size);
 #elif defined _POSIX_C_SOURCE && (_POSIX_C_SOURCE >= 200112L)
     if (posix_memalign(&ptr, alignment, size) != 0) ptr = nullptr;
 #else

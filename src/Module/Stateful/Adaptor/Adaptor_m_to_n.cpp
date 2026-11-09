@@ -5,6 +5,7 @@
 #include "Module/Stateful/Adaptor/Adaptor_m_to_n.hpp"
 #include "Tools/Display/Statistics/Statistics.hpp"
 #include "Tools/Math/utils.h"
+#include "Tools/System/memory.hpp"
 
 using namespace spu;
 using namespace spu::module;
@@ -12,7 +13,7 @@ using namespace spu::module;
 Adaptor_m_to_n::~Adaptor_m_to_n()
 {
     for (auto b : this->buffer_to_free)
-        delete[] b;
+        tools::buffer_free(b);
     if (this->cloned) (*this->n_clones)--;
 }
 
@@ -92,7 +93,7 @@ Adaptor_m_to_n::alloc_buffers()
         for (size_t b = 0; b < this->buffer_size; b++)
             for (size_t s = 0; s < this->n_sockets; s++)
             {
-                int8_t* ptr = new int8_t[this->n_frames * this->n_bytes[s]];
+                int8_t* ptr = tools::buffer_alloc<int8_t>(this->n_frames * this->n_bytes[s]);
                 (*this->buffer)[(d * this->buffer_size + b) * this->n_sockets + s] = ptr;
                 this->buffer_to_free.push_back(ptr);
             }
@@ -202,14 +203,14 @@ Adaptor_m_to_n::set_n_frames(const size_t n_frames)
                     {
                         const size_t idx = (d * this->buffer_size + b) * this->n_sockets + s;
                         auto old_ptr = (*this->buffer)[idx];
-                        int8_t* new_ptr = new int8_t[this->n_bytes[s] * n_frames];
+                        int8_t* new_ptr = tools::buffer_alloc<int8_t>(this->n_bytes[s] * n_frames);
                         (*this->buffer)[idx] = new_ptr;
 
                         bool found = false;
                         for (size_t bf = 0; bf < this->buffer_to_free.size(); bf++)
                             if (this->buffer_to_free[bf] == old_ptr)
                             {
-                                delete[] this->buffer_to_free[bf];
+                                tools::buffer_free(this->buffer_to_free[bf]);
                                 this->buffer_to_free[bf] = new_ptr;
                                 found = true;
                                 break;
@@ -325,7 +326,8 @@ Adaptor_m_to_n::wait_push()
                 std::unique_lock<std::mutex> lock((*this->mtx_push.get())[this->cur_push_id]);
                 ((*this->cnd_push.get())[this->cur_push_id])
                   .wait(lock,
-                        [this]() {
+                        [this]()
+                        {
                             return !(this->is_full(this->cur_push_id) &&
                                      !this->waiting_canceled->load(std::memory_order_relaxed));
                         });
@@ -397,7 +399,8 @@ Adaptor_m_to_n::wait_pull()
                 std::unique_lock<std::mutex> lock((*this->mtx_pull.get())[this->cur_pull_id]);
                 ((*this->cnd_pull.get())[this->cur_pull_id])
                   .wait(lock,
-                        [this]() {
+                        [this]()
+                        {
                             return !(this->is_empty(this->cur_pull_id) &&
                                      !this->waiting_canceled->load(std::memory_order_relaxed));
                         });
