@@ -94,6 +94,8 @@ class Module_Julia
             size_t n_elmts;       //!< Number of elements in the 1D Julia array view.
             jl_value_t* jl_array; //!< Pointer to the 1D Julia `Array` object (`jl_array_t*`).
             size_t jl_id;         //!< Slot index in the owning thread's `Ref_keeper` keeping `jl_array` GC-rooted.
+            void* keeper;         //!< `Ref_keeper` (`thread_local`) that owns `jl_id`: the thread that executed the
+                                  //!< task when the entry was created, not necessarily the one that called `eval()`.
         };
         std::vector<Entry> entries; //!< Cached `(dataptr, n_elmts) -> jl_array` descriptors for this socket.
     };

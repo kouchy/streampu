@@ -51,6 +51,25 @@ Module_Julia::get_jl_datatype(const runtime::Socket* sck)
     }
 }
 
+// A `Ref_keeper` is `thread_local` (one per thread, not thread-safe) and a slot index is only valid in the keeper
+// that allocated it. A socket array is rooted by the thread that executes the task, which is not necessarily the one
+// that evaluated the module (e.g. a module evaluated on the main thread and executed by a `Pipeline` stage thread),
+// so each cache entry records its keeper. Update the slot in place only when it belongs to the current thread;
+// otherwise root the new array in the current thread's keeper (the old slot is left to its keeper, it keeps a
+// non-owning array view alive, which is harmless).
+static inline void
+reroot_socket_array(size_t& jl_id, void*& keeper, jl_value_t* jl_arr)
+{
+    tools::Ref_keeper* current = tools::Ref_keeper::get();
+    if (keeper == (void*)current)
+        current->update_value(jl_id, jl_arr);
+    else
+    {
+        jl_id = current->mark(jl_arr);
+        keeper = (void*)current;
+    }
+}
+
 jl_value_t*
 Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void* p, const size_t n_elmts)
 {
@@ -108,7 +127,7 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
 
             auto gc_state = jl_gc_enable(0);
             jl_value_t* jl_arr = (jl_value_t*)jl_ptr_to_array_1d(cache.array_type, p, n_elmts, 0);
-            tools::Ref_keeper::get()->update_value(entry.jl_id, jl_arr);
+            reroot_socket_array(entry.jl_id, entry.keeper, jl_arr);
             jl_gc_enable(gc_state);
 
             entry.dataptr = p;
@@ -130,9 +149,10 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
     jl_value_t* jl_arr = (jl_value_t*)jl_ptr_to_array_1d(cache.array_type, p, n_elmts, 0);
     if (n_entries < max_entries)
     {
+        // Released by `~Module_Julia()` from `cache.entries` (not `jl_constants_id`, which belongs to the keeper
+        // of the evaluating thread)
         size_t jl_id = tools::Julia::preserve(jl_arr);
-        this->jl_constants_id[tid].push_back(jl_id);
-        cache.entries.push_back({ p, n_elmts, jl_arr, jl_id });
+        cache.entries.push_back({ p, n_elmts, jl_arr, jl_id, (void*)tools::Ref_keeper::get() });
         cache.last_hit_idx = n_entries;
     }
     else
@@ -142,7 +162,7 @@ Module_Julia::get_or_create_socket_array(const size_t tid, const size_t s, void*
         auto& victim = cache.entries[evict_idx];
         const size_t old_h = Socket_jl_cache::hash_dataptr(victim.dataptr);
         if (cache.ht[old_h].dataptr == victim.dataptr) cache.ht[old_h] = { nullptr, nullptr };
-        tools::Ref_keeper::get()->update_value(victim.jl_id, jl_arr);
+        reroot_socket_array(victim.jl_id, victim.keeper, jl_arr);
         victim.dataptr = p;
         victim.n_elmts = n_elmts;
         victim.jl_array = jl_arr;
@@ -203,6 +223,23 @@ Module_Julia::~Module_Julia()
             for (size_t jl_id : this->jl_constants_id[tid])
                 tools::Julia::release(jl_id);
     }
+
+    // Socket arrays: release only the slots owned by the current thread's keeper. The others belong to the keeper
+    // of another thread (e.g. a `Pipeline` stage thread): releasing them here would corrupt the freelist of this
+    // thread's keeper and unroot unrelated Julia objects. They are left to their keeper, as the states and the
+    // constants of a module evaluated by another thread.
+    tools::Ref_keeper* keeper = tools::Ref_keeper::get();
+    auto release_socket_arrays = [keeper](Task_jl_cache& tcache)
+    {
+        for (auto& cache : tcache.sockets)
+            for (auto& entry : cache.entries)
+                if (entry.keeper == (void*)keeper) keeper->unmark(entry.jl_id);
+    };
+    for (size_t i = 0; i < SPU_MAX_INLINE_TASKS; i++)
+        release_socket_arrays(this->inline_tasks_cache[i]);
+    for (auto& tcache : this->extra_tasks_cache)
+        release_socket_arrays(tcache);
+
     (*this->n_clones)--;
 }
 
@@ -757,10 +794,18 @@ end
 
     const size_t n_types = func_args.size();
     void* out_ptrs[2] = { nullptr, nullptr };
-    (void)jl_call3(make_trampoline_fn,
-                   jl_box_voidpointer((void*)func_args.data()),
-                   jl_box_int64((int64_t)n_types),
-                   jl_box_voidpointer((void*)out_ptrs));
+    // Root the boxed arguments: each `jl_box_*` allocates, and a GC (triggered by any thread, e.g. another `Pipeline`
+    // stage) between two allocations would collect the boxes created before (`jl_call3` only roots its arguments
+    // once it is entered).
+    jl_value_t* jl_args_ptr = nullptr;
+    jl_value_t* jl_n_types = nullptr;
+    jl_value_t* jl_out_ptrs = nullptr;
+    JL_GC_PUSH3(&jl_args_ptr, &jl_n_types, &jl_out_ptrs);
+    jl_args_ptr = jl_box_voidpointer((void*)func_args.data());
+    jl_n_types = jl_box_int64((int64_t)n_types);
+    jl_out_ptrs = jl_box_voidpointer((void*)out_ptrs);
+    (void)jl_call3(make_trampoline_fn, jl_args_ptr, jl_n_types, jl_out_ptrs);
+    JL_GC_POP();
 
     if (jl_exception_occurred() || out_ptrs[0] == nullptr || out_ptrs[1] == nullptr)
     {
