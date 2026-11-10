@@ -21,8 +21,12 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
   , datatype(datatype)
   , buffer_size(buffer_size)
   , n_sockets(n_elmts.size())
-  , buffer(new std::vector<int8_t*>(n_sockets * buffer_size, nullptr))
-  , return_buffer(new std::vector<int8_t*>(n_sockets * buffer_size, nullptr))
+  , buffer(new std::vector<int8_t*, tools::aligned_allocator<int8_t*>>(
+      Adaptor_m_to_n::compute_channel_stride(n_elmts.size() * buffer_size),
+      nullptr))
+  , return_buffer(new std::vector<int8_t*, tools::aligned_allocator<int8_t*>>(
+      Adaptor_m_to_n::compute_channel_stride(n_elmts.size() * buffer_size),
+      nullptr))
   , channels(new std::vector<SPSC_channel_sync, tools::aligned_allocator<SPSC_channel_sync>>(1000))
   , channels_ptr(this->channels->data())
   , waiting_canceled(new std::atomic<bool>(false))
@@ -42,7 +46,9 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
   , n_clones(new size_t(0))
   , buffers_allocated(new bool(false))
   , cloned(false)
-  , ts_buffer(new std::vector<std::vector<uint64_t>>(1, std::vector<uint64_t>(buffer_size, 0)))
+  , ts_buffer(
+      new std::vector<uint64_t, tools::aligned_allocator<uint64_t>>(Adaptor_m_to_n::compute_channel_stride(buffer_size),
+                                                                    0))
   , cur_push_id(0)
   , push_birth_ts_ptr(nullptr)
   , push_stage_start_ts_ptr(nullptr)
@@ -50,6 +56,7 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
   , cur_pull_id(0)
   , pull_birth_ts_ptr(nullptr)
   , pull_stage_start_ts_ptr(nullptr)
+  , pad_adp_pull_end{}
 {
     const std::string name = "Adaptor_m_to_n";
     this->set_name(name);
@@ -80,8 +87,7 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
         }
     }
 
-    this->channels_ptr[0].push_ts_base =
-      (buffer_size <= 2) ? this->channels_ptr[0].inline_ts : (*this->ts_buffer)[0].data();
+    this->channels_ptr[0].push_ts_base = (buffer_size <= 2) ? this->channels_ptr[0].inline_ts : this->ts_buffer->data();
     this->channels_ptr[0].pull_ts_base = this->channels_ptr[0].push_ts_base;
     this->channels_ptr[0].push_n_channels = 1;
     this->channels_ptr[0].pull_n_channels = 1;
@@ -234,14 +240,17 @@ Adaptor_m_to_n::is_no_copy_push() const noexcept
 //   strictly unidirectional tables so Pusher and Puller never write to the same cache line:
 //   * If `stride = buffer_size * n_sockets <= 2`, we use `ch.inline_forward_slots` (embedded in Pusher's cache line)
 //     and `ch.inline_return_slots` (embedded in Puller's cache line) for 1-cache-line zero-copy handoff.
-//   * If `stride > 2`, we use `this->buffer` (forward table) and `this->return_buffer` (return table).
+//   * If `stride > 2`, we use `this->buffer` (forward table) and `this->return_buffer` (return table), where each
+//     channel `d` starts on an exact 128-byte boundary (`d * channel_stride`).
 // - Case 2 (`dual_no_copy == false`, i.e. copy mode or asymmetric hybrid mode where only one side is `no_copy`):
-//   All four pointers point to the same shared table `&(*this->buffer)[d * stride]`, preserving full compatibility
-//   when one side copies via `get_empty_buffer(sid)` / `get_filled_buffer(sid)` without swapping a buffer back.
+//   All four pointers point to the same shared table `&(*this->buffer)[d * channel_stride]`, preserving full
+//   compatibility when one side copies via `get_empty_buffer(sid)` / `get_filled_buffer(sid)` without swapping a
+//   buffer back.
 inline void
 Adaptor_m_to_n::update_slot_pointers() noexcept
 {
     const size_t stride = this->buffer_size * this->n_sockets;
+    const size_t ch_stride = Adaptor_m_to_n::compute_channel_stride(stride);
     const size_t n_ch = this->channels_ptr[0].push_n_channels;
     const bool dual_no_copy = ((*this->shared_no_copy_flags & 0x3) == 0x3);
     for (size_t d = 0; d < n_ch; d++)
@@ -258,15 +267,15 @@ Adaptor_m_to_n::update_slot_pointers() noexcept
             }
             else
             {
-                ch.push_write_slots = &(*this->buffer)[d * stride];
-                ch.pull_read_slots = &(*this->buffer)[d * stride];
-                ch.pull_write_slots = &(*this->return_buffer)[d * stride];
-                ch.push_read_slots = &(*this->return_buffer)[d * stride];
+                ch.push_write_slots = &(*this->buffer)[d * ch_stride];
+                ch.pull_read_slots = &(*this->buffer)[d * ch_stride];
+                ch.pull_write_slots = &(*this->return_buffer)[d * ch_stride];
+                ch.push_read_slots = &(*this->return_buffer)[d * ch_stride];
             }
         }
         else
         {
-            int8_t** shared_base = &(*this->buffer)[d * stride];
+            int8_t** shared_base = &(*this->buffer)[d * ch_stride];
             ch.push_write_slots = shared_base;
             ch.pull_read_slots = shared_base;
             ch.pull_write_slots = shared_base;

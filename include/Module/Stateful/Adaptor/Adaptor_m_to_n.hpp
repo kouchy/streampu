@@ -23,6 +23,7 @@
 #include "Runtime/Socket/Socket.hpp"
 #include "Runtime/Task/Task.hpp"
 #include "Tools/Interface/Interface_waiting.hpp"
+#include "Tools/System/memory.hpp"
 
 namespace spu
 {
@@ -45,6 +46,11 @@ class Adaptor_m_to_n
     friend runtime::Sequence; // Sequence is friend to enable the no copy mode (0 copy)
 
   public:
+    static inline void* operator new(std::size_t size) { return tools::mem_alloc(size); }
+    static inline void operator delete(void* ptr) noexcept { tools::mem_free(ptr); }
+    static inline void* operator new(std::size_t /*size*/, void* ptr) noexcept { return ptr; }
+    static inline void operator delete(void* /*ptr*/, void* /*place*/) noexcept {}
+
     // Portable hardware spin-wait hint (`cpu_relax`):
     // Throttles speculative out-of-order loads inside active spin-wait loops (`while (is_full)` / `while (is_empty)`),
     // preventing memory-order-violation pipeline flushes (~15-25 ns penalty on wakeup) and reducing interconnect
@@ -104,41 +110,56 @@ class Adaptor_m_to_n
     // 4. Inline Slot & Timestamp Embedding (`inline_forward_slots[2]`, `inline_return_slots[2]`, `inline_ts[2]`):
     //    - When `stride = buffer_size * n_sockets <= 2` (covering the latency-critical `buffer_size = 1` with 1 or 2
     //      sockets, or `buffer_size = 2` with 1 socket), `push_write_slots`/`pull_read_slots` point directly to
-    //      `inline_forward_slots` (located at bytes 48..63 of the Pusher's cache line, right next to `write_pos`), and
-    //      `pull_write_slots`/`push_read_slots` point directly to `inline_return_slots` (located at bytes 176..191 of
+    //      `inline_forward_slots` (located at bytes 40..55 of the Pusher's cache line, right next to `write_pos`),
+    //      `inline_ts[0]` sits at bytes 56..63 of that same first 64-byte L1 cache line, and
+    //      `pull_write_slots`/`push_read_slots` point directly to `inline_return_slots` (located at bytes 168..183 of
     //      the Puller's cache line, right next to `read_pos`).
-    //    - Consequently, when the Pusher writes the filled buffer pointer into `inline_forward_slots` and publishes
-    //      `write_pos + 1`, both stores hit the SAME 64-byte L1 cache line owned by the Pusher; when the Puller wakes
-    //      up and reads `write_pos` + `inline_forward_slots`, a SINGLE cross-core cache-line transfer delivers both the
-    //      synchronization counter and the data pointer!
-    // 5. Dedicated 128-Byte Cache-Line Isolation (`SPU_CACHE_LINE_SIZE`):
-    //    Pusher-owned fields (bytes 0..127) and Puller-owned fields (bytes 128..255) are isolated in separate 128-byte
-    //    blocks so neither core's stores or hardware spatial prefetcher can invalidate the peer core's L1/L2 lines.
-    struct SPSC_channel_sync
+    //    - Consequently, when the Pusher writes the filled buffer pointer into `inline_forward_slots` (and birth
+    //      timestamp into `inline_ts[0]`) and publishes `write_pos + 1`, all stores hit the SAME 64-byte L1 cache line
+    //      owned by the Pusher; when the Puller wakes up and reads `write_pos` + `inline_forward_slots` (+
+    //      `inline_ts[0]`), a SINGLE cross-core cache-line transfer delivers the synchronization counter, data pointer,
+    //      and birth timestamp!
+    // 5. Dedicated 128-Byte Cache-Line Alignment & MOESI/MESIF Coherence Isolation
+    // (`SPU_ALIGNAS(SPU_CACHE_LINE_SIZE)`):
+    //    - Pusher-owned fields (bytes 0..127) and Puller-owned fields (bytes 128..255) are aligned and isolated in
+    //      separate 128-byte blocks so neither core's stores or hardware spatial prefetcher (which fetches 128-byte
+    //      even/odd line pairs on Intel MESIF and AMD Zen MOESI) can invalidate the peer core's L1/L2 lines.
+    //    - On MOESI architectures (ARM64 / Apple Silicon and AMD Zen) as well as MESIF architectures (Intel Core /
+    //      Xeon), each half-struct has a single writer (Pusher for bytes 0..127, Puller for bytes 128..255). Combined
+    //      with the Zero-Store Spin invariant in `is_full()` / `is_empty()` and custom 128-byte aligned `operator new`
+    //      + `tools::aligned_allocator`, the producer's line transitions strictly `M -> O (MOESI) or S (MESIF) -> M`
+    //      without write-write ping-pong or small-chunk heap slab false sharing.
+    struct SPU_ALIGNAS(SPU_CACHE_LINE_SIZE) SPSC_channel_sync
     {
+        static inline void* operator new(std::size_t size) { return tools::mem_alloc(size); }
+        static inline void operator delete(void* ptr) noexcept { tools::mem_free(ptr); }
+        static inline void* operator new(std::size_t /*size*/, void* ptr) noexcept { return ptr; }
+        static inline void operator delete(void* /*ptr*/, void* /*place*/) noexcept {}
+
         // --- Pusher-owned cache line (written exclusively by the upstream Pusher thread) ---
         std::atomic<uint64_t> write_pos; // Total frames published by the Pusher since reset (offset 0, 8B)
         uint64_t read_pos_cache;         // Pusher's private shadow copy of `read_pos` (offset 8, 8B)
         int8_t** push_read_slots;        // Slot table from which Pusher reads empty buffer (offset 16, 8B)
         int8_t** push_write_slots;       // Slot table into which Pusher writes filled swap_buffer (offset 24, 8B)
-        uint64_t* push_ts_base;          // Direct pointer to channel's timestamp ring (offset 32, 8B)
-        uint32_t write_slot;             // Current ring-buffer slot index in `[0, capacity - 1]` (offset 40, 4B)
-        uint32_t push_n_channels;        // Cached total number of sub-channels (`ppcm`) (offset 44, 4B)
-        int8_t* inline_forward_slots[2]; // Inline Pusher->Puller slot storage for stride <= 2 (offset 48..63, 16B)
-        uint64_t inline_ts[2];           // Inline birth timestamp storage for buffer_size <= 2 (offset 64..79, 16B)
+        uint32_t write_slot;             // Current ring-buffer slot index in `[0, capacity - 1]` (offset 32, 4B)
+        uint32_t push_n_channels;        // Cached total number of sub-channels (`ppcm`) (offset 36, 4B)
+        int8_t* inline_forward_slots[2]; // Inline Pusher->Puller slot storage for stride <= 2 (offset 40..55, 16B)
+        uint64_t inline_ts[2];           // Inline birth timestamp storage for buffer_size <= 2 (offset 56..71, 16B)
+        uint64_t* push_ts_base;          // Direct pointer to channel's timestamp ring (offset 72..79, 8B)
         uint8_t pad_pusher[SPU_CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>) - sizeof(uint64_t) -
                            2 * sizeof(int8_t**) - sizeof(uint64_t*) - 2 * sizeof(uint32_t) - 2 * sizeof(int8_t*) -
                            2 * sizeof(uint64_t)];
 
         // --- Puller-owned cache line (written exclusively by the downstream Puller thread) ---
+        SPU_ALIGNAS(SPU_CACHE_LINE_SIZE)
         std::atomic<uint64_t> read_pos; // Total frames consumed by the Puller since reset (offset 128, 8B)
         uint64_t write_pos_cache;       // Puller's private shadow copy of `write_pos` (offset 136, 8B)
         int8_t** pull_read_slots;       // Slot table from which Puller reads filled buffer (offset 144, 8B)
         int8_t** pull_write_slots;      // Slot table into which Puller writes returned swap_buffer (offset 152, 8B)
-        uint64_t* pull_ts_base;         // Direct pointer to channel's timestamp ring (offset 160, 8B)
-        uint32_t read_slot;             // Current ring-buffer slot index in `[0, capacity - 1]` (offset 168, 4B)
-        uint32_t pull_n_channels;       // Cached total number of sub-channels (`ppcm`) (offset 172, 4B)
-        int8_t* inline_return_slots[2]; // Inline Puller->Pusher slot storage for stride <= 2 (offset 176..191, 16B)
+        uint32_t read_slot;             // Current ring-buffer slot index in `[0, capacity - 1]` (offset 160, 4B)
+        uint32_t pull_n_channels;       // Cached total number of sub-channels (`ppcm`) (offset 164, 4B)
+        int8_t* inline_return_slots[2]; // Inline Puller->Pusher slot storage for stride <= 2 (offset 168..183, 16B)
+        uint64_t* pull_ts_base;         // Direct pointer to channel's timestamp ring (offset 184..191, 8B)
         uint8_t pad_puller[SPU_CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>) - sizeof(uint64_t) -
                            2 * sizeof(int8_t**) - sizeof(uint64_t*) - 2 * sizeof(uint32_t) - 2 * sizeof(int8_t*)];
 
@@ -147,20 +168,20 @@ class Adaptor_m_to_n
           , read_pos_cache(0)
           , push_read_slots(nullptr)
           , push_write_slots(nullptr)
-          , push_ts_base(nullptr)
           , write_slot(0)
           , push_n_channels(1)
           , inline_forward_slots{ nullptr, nullptr }
           , inline_ts{ 0, 0 }
+          , push_ts_base(nullptr)
           , pad_pusher{}
           , read_pos(0)
           , write_pos_cache(0)
           , pull_read_slots(nullptr)
           , pull_write_slots(nullptr)
-          , pull_ts_base(nullptr)
           , read_slot(0)
           , pull_n_channels(1)
           , inline_return_slots{ nullptr, nullptr }
+          , pull_ts_base(nullptr)
           , pad_puller{}
         {
         }
@@ -170,20 +191,20 @@ class Adaptor_m_to_n
           , read_pos_cache(other.read_pos_cache)
           , push_read_slots(other.push_read_slots)
           , push_write_slots(other.push_write_slots)
-          , push_ts_base(other.push_ts_base)
           , write_slot(other.write_slot)
           , push_n_channels(other.push_n_channels)
           , inline_forward_slots{ other.inline_forward_slots[0], other.inline_forward_slots[1] }
           , inline_ts{ other.inline_ts[0], other.inline_ts[1] }
+          , push_ts_base(other.push_ts_base)
           , pad_pusher{}
           , read_pos(other.read_pos.load(std::memory_order_relaxed))
           , write_pos_cache(other.write_pos_cache)
           , pull_read_slots(other.pull_read_slots)
           , pull_write_slots(other.pull_write_slots)
-          , pull_ts_base(other.pull_ts_base)
           , read_slot(other.read_slot)
           , pull_n_channels(other.pull_n_channels)
           , inline_return_slots{ other.inline_return_slots[0], other.inline_return_slots[1] }
+          , pull_ts_base(other.pull_ts_base)
           , pad_puller{}
         {
         }
@@ -196,22 +217,22 @@ class Adaptor_m_to_n
                 this->read_pos_cache = other.read_pos_cache;
                 this->push_read_slots = other.push_read_slots;
                 this->push_write_slots = other.push_write_slots;
-                this->push_ts_base = other.push_ts_base;
                 this->write_slot = other.write_slot;
                 this->push_n_channels = other.push_n_channels;
                 this->inline_forward_slots[0] = other.inline_forward_slots[0];
                 this->inline_forward_slots[1] = other.inline_forward_slots[1];
                 this->inline_ts[0] = other.inline_ts[0];
                 this->inline_ts[1] = other.inline_ts[1];
+                this->push_ts_base = other.push_ts_base;
                 this->read_pos.store(other.read_pos.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 this->write_pos_cache = other.write_pos_cache;
                 this->pull_read_slots = other.pull_read_slots;
                 this->pull_write_slots = other.pull_write_slots;
-                this->pull_ts_base = other.pull_ts_base;
                 this->read_slot = other.read_slot;
                 this->pull_n_channels = other.pull_n_channels;
                 this->inline_return_slots[0] = other.inline_return_slots[0];
                 this->inline_return_slots[1] = other.inline_return_slots[1];
+                this->pull_ts_base = other.pull_ts_base;
             }
             return *this;
         }
@@ -301,6 +322,9 @@ class Adaptor_m_to_n
         }
     };
 
+    static_assert(sizeof(SPSC_channel_sync) == 2 * SPU_CACHE_LINE_SIZE,
+                  "SPSC_channel_sync must be exactly 2 * SPU_CACHE_LINE_SIZE bytes (256B)");
+
   protected:
     std::vector<size_t> n_elmts;
     std::vector<size_t> n_bytes;
@@ -308,15 +332,20 @@ class Adaptor_m_to_n
     const size_t buffer_size;
     const size_t n_sockets;
 
-    // Flat 1D slot-major buffer tables indexed as `(d * buffer_size + b) * n_sockets + s`.
-    // When both `no_copy_push` and `no_copy_pull` are active, `buffer` serves as the unidirectional forward slot
-    // table (written ONLY by Pusher, read ONLY by Puller) and `return_buffer` serves as the unidirectional return
-    // slot table (written ONLY by Puller, read ONLY by Pusher), eliminating write-write RFO cache-line conflicts.
-    // Furthermore, for `buffer_size * n_sockets <= 2`, slots are stored directly inside `SPSC_channel_sync`'s
-    // `inline_forward_slots` (on the Pusher's cache line alongside `write_pos`) and `inline_return_slots` (on the
-    // Puller's cache line alongside `read_pos`), achieving 1-cache-line zero-copy handoff per direction.
-    std::shared_ptr<std::vector<int8_t*>> buffer;
-    std::shared_ptr<std::vector<int8_t*>> return_buffer;
+    // 128-byte aligned flat 1D slot-major buffer tables where each sub-channel `d` is padded to a multiple of
+    // `SPU_CACHE_LINE_SIZE / sizeof(int8_t*)` (16 pointers = 128 bytes):
+    // - When both `no_copy_push` and `no_copy_pull` are active, `buffer` serves as the unidirectional forward slot
+    //   table (written ONLY by Pusher, read ONLY by Puller) and `return_buffer` serves as the unidirectional return
+    //   slot table (written ONLY by Puller, read ONLY by Pusher).
+    // - Allocating both tables via `tools::aligned_allocator` guarantees that `buffer->data()` and
+    //   `return_buffer->data()` never share a 128-byte cache line in the heap allocator's small-chunk slab (even when
+    //   `buffer_size = 4` or `8`), and padding each channel `d` to 128 bytes prevents false sharing between threads
+    //   in multi-channel `M -> N` stages.
+    // - Furthermore, for `buffer_size * n_sockets <= 2`, slots are stored directly inside `SPSC_channel_sync`'s
+    //   `inline_forward_slots` (on the Pusher's cache line alongside `write_pos`) and `inline_return_slots` (on the
+    //   Puller's cache line alongside `read_pos`), achieving 1-cache-line zero-copy handoff per direction.
+    std::shared_ptr<std::vector<int8_t*, tools::aligned_allocator<int8_t*>>> buffer;
+    std::shared_ptr<std::vector<int8_t*, tools::aligned_allocator<int8_t*>>> return_buffer;
     std::vector<int8_t*> buffer_to_free;
 
     std::shared_ptr<std::vector<SPSC_channel_sync, tools::aligned_allocator<SPSC_channel_sync>>> channels;
@@ -346,21 +375,22 @@ class Adaptor_m_to_n
     std::shared_ptr<bool> buffers_allocated;
     bool cloned;
 
-    // Shared ring buffer of frame birth timestamps (`[queue_id][slot_id]`) and per-thread pointers used when
-    // `Pipeline::set_rt_stats(true)` is enabled.
-    std::shared_ptr<std::vector<std::vector<uint64_t>>> ts_buffer;
+    // 128-byte aligned flat ring buffer of frame birth timestamps (`d * ts_channel_stride + slot_id`) used when
+    // `Pipeline::set_rt_stats(true)` is enabled and `buffer_size > 2`.
+    std::shared_ptr<std::vector<uint64_t, tools::aligned_allocator<uint64_t>>> ts_buffer;
 
-    // Separate Pusher-local and Puller-local hot fields onto distinct cache lines so that when `Pipeline` shares
-    // the master `Adaptor_m_to_n` instance `adp` (`t == 0`) between Stage `sta` (`push`) and Stage `sta + 1` (`pull`),
-    // Pusher and Puller never suffer false sharing on `cur_push_id` vs. `cur_pull_id`.
-    size_t cur_push_id;
+    // Separate Pusher-local and Puller-local hot fields onto distinct 128-byte aligned cache lines so that when
+    // `Pipeline` shares the master `Adaptor_m_to_n` instance `adp` (`t == 0`) between Stage `sta` (`push`) and Stage
+    // `sta + 1` (`pull`), Pusher and Puller never suffer false sharing on `cur_push_id` vs. `cur_pull_id`.
+    SPU_ALIGNAS(SPU_CACHE_LINE_SIZE) size_t cur_push_id;
     uint64_t* push_birth_ts_ptr;
     uint64_t* push_stage_start_ts_ptr;
     uint8_t pad_adp_push_pull[SPU_CACHE_LINE_SIZE - sizeof(size_t) - 2 * sizeof(uint64_t*)];
 
-    size_t cur_pull_id;
+    SPU_ALIGNAS(SPU_CACHE_LINE_SIZE) size_t cur_pull_id;
     uint64_t* pull_birth_ts_ptr;
     uint64_t* pull_stage_start_ts_ptr;
+    uint8_t pad_adp_pull_end[SPU_CACHE_LINE_SIZE - sizeof(size_t) - 2 * sizeof(uint64_t*)];
 
   public:
     inline Adaptor_m_to_n(const size_t n_elmts,
@@ -398,6 +428,12 @@ class Adaptor_m_to_n
     }
 
   protected:
+    static inline size_t compute_channel_stride(const size_t raw_stride) noexcept
+    {
+        static constexpr size_t elts_per_line = SPU_CACHE_LINE_SIZE / sizeof(int8_t*);
+        return (raw_stride + elts_per_line - 1) & ~(elts_per_line - 1);
+    }
+
     void send_cancel_signal();
     inline void init();
     void deep_copy(const Adaptor_m_to_n& m);

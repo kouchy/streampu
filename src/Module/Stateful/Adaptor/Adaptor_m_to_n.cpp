@@ -79,9 +79,11 @@ Adaptor_m_to_n::alloc_buffers()
     }
 
     const size_t stride = this->buffer_size * this->n_sockets;
-    this->buffer->resize(ppcm * stride, nullptr);
-    this->return_buffer->resize(ppcm * stride, nullptr);
-    this->ts_buffer->resize(ppcm, std::vector<uint64_t>(this->buffer_size, 0));
+    const size_t ch_stride = Adaptor_m_to_n::compute_channel_stride(stride);
+    const size_t ts_ch_stride = Adaptor_m_to_n::compute_channel_stride(this->buffer_size);
+    this->buffer->assign(ppcm * ch_stride, nullptr);
+    this->return_buffer->assign(ppcm * ch_stride, nullptr);
+    this->ts_buffer->assign(ppcm * ts_ch_stride, 0);
 
     if (this->buffer_to_free.size())
     {
@@ -90,7 +92,7 @@ Adaptor_m_to_n::alloc_buffers()
         throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
     }
 
-    // Allocate one 64-byte aligned buffer per (sub-channel `d`, ring slot `b`, socket `s`) and initialize all slot
+    // Allocate one 128-byte aligned buffer per (sub-channel `d`, ring slot `b`, socket `s`) and initialize all slot
     // tables (`this->buffer`, `this->return_buffer`, and when `stride <= 2`, the inline cache-line-local arrays
     // `ch.inline_forward_slots` and `ch.inline_return_slots`) with the same initial pointer `ptr`.
     // In dual zero-copy mode (`no_copy_push && no_copy_pull`), `return_buffer` / `inline_return_slots` supply the
@@ -105,8 +107,8 @@ Adaptor_m_to_n::alloc_buffers()
             {
                 const size_t k = b * this->n_sockets + s;
                 int8_t* ptr = tools::buffer_alloc<int8_t>(this->n_frames * this->n_bytes[s]);
-                (*this->buffer)[d * stride + k] = ptr;
-                (*this->return_buffer)[d * stride + k] = ptr;
+                (*this->buffer)[d * ch_stride + k] = ptr;
+                (*this->return_buffer)[d * ch_stride + k] = ptr;
                 if (stride <= 2)
                 {
                     ch.inline_forward_slots[k] = ptr;
@@ -115,8 +117,8 @@ Adaptor_m_to_n::alloc_buffers()
                 this->buffer_to_free.push_back(ptr);
             }
         // When `buffer_size <= 2`, embed the per-slot birth timestamp ring directly inside `ch.inline_ts` on the
-        // Pusher's cache line to avoid an extra heap indirection (`(*this->ts_buffer)[d]`) during E2E RT stats.
-        ch.push_ts_base = (this->buffer_size <= 2) ? ch.inline_ts : (*this->ts_buffer)[d].data();
+        // Pusher's cache line to avoid an extra heap indirection (`ts_buffer`) during E2E RT stats.
+        ch.push_ts_base = (this->buffer_size <= 2) ? ch.inline_ts : &(*this->ts_buffer)[d * ts_ch_stride];
         ch.pull_ts_base = ch.push_ts_base;
         ch.push_n_channels = static_cast<uint32_t>(ppcm);
         ch.pull_n_channels = static_cast<uint32_t>(ppcm);
@@ -218,6 +220,7 @@ Adaptor_m_to_n::reset_buffer()
     if (!this->cloned && *this->buffers_allocated)
     {
         const size_t stride = this->buffer_size * this->n_sockets;
+        const size_t ch_stride = Adaptor_m_to_n::compute_channel_stride(stride);
         const size_t n_ch = this->channels_ptr[0].push_n_channels;
         for (size_t d = 0; d < n_ch; d++)
         {
@@ -225,8 +228,8 @@ Adaptor_m_to_n::reset_buffer()
             for (size_t k = 0; k < stride; k++)
             {
                 int8_t* ptr = this->buffer_to_free[d * stride + k];
-                (*this->buffer)[d * stride + k] = ptr;
-                (*this->return_buffer)[d * stride + k] = ptr;
+                (*this->buffer)[d * ch_stride + k] = ptr;
+                (*this->return_buffer)[d * ch_stride + k] = ptr;
                 if (stride <= 2)
                 {
                     ch.inline_forward_slots[k] = ptr;
@@ -247,13 +250,14 @@ Adaptor_m_to_n::set_n_frames(const size_t n_frames)
         if (!this->cloned && *this->buffers_allocated)
         {
             const size_t stride = this->buffer_size * this->n_sockets;
+            const size_t ch_stride = Adaptor_m_to_n::compute_channel_stride(stride);
             const size_t n_ch = this->channels_ptr[0].push_n_channels;
             for (size_t d = 0; d < n_ch; d++)
                 for (size_t b = 0; b < this->buffer_size; b++)
                     for (size_t s = 0; s < this->n_sockets; s++)
                     {
                         const size_t k = b * this->n_sockets + s;
-                        const size_t idx = d * stride + k;
+                        const size_t idx = d * ch_stride + k;
                         auto old_ptr = (*this->buffer)[idx];
                         int8_t* new_ptr = tools::buffer_alloc<int8_t>(this->n_bytes[s] * n_frames);
                         (*this->buffer)[idx] = new_ptr;
