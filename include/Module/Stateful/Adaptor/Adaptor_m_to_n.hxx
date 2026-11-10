@@ -22,9 +22,12 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
   , buffer_size(buffer_size)
   , n_sockets(n_elmts.size())
   , buffer(new std::vector<int8_t*>(n_sockets * buffer_size, nullptr))
-  , channels(new std::vector<SPSC_channel_sync>(1000))
+  , return_buffer(new std::vector<int8_t*>(n_sockets * buffer_size, nullptr))
+  , channels(new std::vector<SPSC_channel_sync, tools::aligned_allocator<SPSC_channel_sync>>(1000))
   , channels_ptr(this->channels->data())
   , waiting_canceled(new std::atomic<bool>(false))
+  , waiting_canceled_ptr(this->waiting_canceled.get())
+  , shared_no_copy_flags(new uint8_t(0))
   , no_copy_pull(false)
   , no_copy_push(false)
   , active_waiting(active_waiting)
@@ -39,11 +42,12 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
   , n_clones(new size_t(0))
   , buffers_allocated(new bool(false))
   , cloned(false)
-  , cur_push_id(0)
-  , cur_pull_id(0)
   , ts_buffer(new std::vector<std::vector<uint64_t>>(1, std::vector<uint64_t>(buffer_size, 0)))
+  , cur_push_id(0)
   , push_birth_ts_ptr(nullptr)
   , push_stage_start_ts_ptr(nullptr)
+  , pad_adp_push_pull{}
+  , cur_pull_id(0)
   , pull_birth_ts_ptr(nullptr)
   , pull_stage_start_ts_ptr(nullptr)
 {
@@ -76,12 +80,12 @@ Adaptor_m_to_n::Adaptor_m_to_n(const std::vector<size_t>& n_elmts,
         }
     }
 
-    this->channels_ptr[0].push_slots_base = this->buffer->data();
-    this->channels_ptr[0].pull_slots_base = this->buffer->data();
-    this->channels_ptr[0].push_ts_base = (*this->ts_buffer)[0].data();
-    this->channels_ptr[0].pull_ts_base = (*this->ts_buffer)[0].data();
+    this->channels_ptr[0].push_ts_base =
+      (buffer_size <= 2) ? this->channels_ptr[0].inline_ts : (*this->ts_buffer)[0].data();
+    this->channels_ptr[0].pull_ts_base = this->channels_ptr[0].push_ts_base;
     this->channels_ptr[0].push_n_channels = 1;
     this->channels_ptr[0].pull_n_channels = 1;
+    this->update_slot_pointers();
 
     this->init();
 }
@@ -221,49 +225,183 @@ Adaptor_m_to_n::is_no_copy_push() const noexcept
     return this->no_copy_push;
 }
 
-void*
+// Configures the per-channel slot table pointers (`push_read_slots`, `push_write_slots`, `pull_read_slots`,
+// `pull_write_slots`) according to whether both ends of the adaptor link operate in zero-copy mode:
+// - Case 1 (`dual_no_copy == true`, i.e. both `no_copy_push` and `no_copy_pull` are active, `*shared_no_copy_flags ==
+// 0x3`):
+//   Pusher and Puller both exchange buffers via `get_empty_buffer(sid, swap_buffer)` and `get_filled_buffer(sid,
+//   swap_buffer)`. We split the forward (Pusher -> Puller) and return (Puller -> Pusher) pointer handoffs into two
+//   strictly unidirectional tables so Pusher and Puller never write to the same cache line:
+//   * If `stride = buffer_size * n_sockets <= 2`, we use `ch.inline_forward_slots` (embedded in Pusher's cache line)
+//     and `ch.inline_return_slots` (embedded in Puller's cache line) for 1-cache-line zero-copy handoff.
+//   * If `stride > 2`, we use `this->buffer` (forward table) and `this->return_buffer` (return table).
+// - Case 2 (`dual_no_copy == false`, i.e. copy mode or asymmetric hybrid mode where only one side is `no_copy`):
+//   All four pointers point to the same shared table `&(*this->buffer)[d * stride]`, preserving full compatibility
+//   when one side copies via `get_empty_buffer(sid)` / `get_filled_buffer(sid)` without swapping a buffer back.
+inline void
+Adaptor_m_to_n::update_slot_pointers() noexcept
+{
+    const size_t stride = this->buffer_size * this->n_sockets;
+    const size_t n_ch = this->channels_ptr[0].push_n_channels;
+    const bool dual_no_copy = ((*this->shared_no_copy_flags & 0x3) == 0x3);
+    for (size_t d = 0; d < n_ch; d++)
+    {
+        auto& ch = this->channels_ptr[d];
+        if (dual_no_copy)
+        {
+            if (stride <= 2)
+            {
+                ch.push_write_slots = ch.inline_forward_slots;
+                ch.pull_read_slots = ch.inline_forward_slots;
+                ch.pull_write_slots = ch.inline_return_slots;
+                ch.push_read_slots = ch.inline_return_slots;
+            }
+            else
+            {
+                ch.push_write_slots = &(*this->buffer)[d * stride];
+                ch.pull_read_slots = &(*this->buffer)[d * stride];
+                ch.pull_write_slots = &(*this->return_buffer)[d * stride];
+                ch.push_read_slots = &(*this->return_buffer)[d * stride];
+            }
+        }
+        else
+        {
+            int8_t** shared_base = &(*this->buffer)[d * stride];
+            ch.push_write_slots = shared_base;
+            ch.pull_read_slots = shared_base;
+            ch.pull_write_slots = shared_base;
+            ch.push_read_slots = shared_base;
+        }
+    }
+}
+
+// Inlined fast-path active spin-wait for the Pusher (`wait_push`) and Puller (`wait_pull`):
+// - In steady-state streaming (`active_waiting == true` and per-stage RT wait-time accounting disabled,
+//   `push_stage_start_ts_ptr == nullptr`), `wait_push()` and `wait_pull()` are invoked on every frame directly from
+//   `Sequence::exec_subsequence[_without_statuses]()`.
+// - Keeping the active-waiting fast path inline in the header avoids a cross-TU function call (`call`/`ret`) per
+//   frame and allows the compiler to hoist `ch`, `cap`, `canceled_ptr`, and `w`/`r` into CPU registers across the
+//   spin loop.
+// - Notice the Zero-Store Spin invariant: while spinning (`w - r >= cap` or `r == w`), the loop only executes
+//   `memory_order_acquire` loads + `cpu_relax()` without writing to `ch.read_pos_cache` / `ch.write_pos_cache`,
+//   so the waiting thread never dirties its own cache line while the peer thread is reading it.
+// - All slower paths (passive `std::condition_variable` waiting, `SPU_JULIA` GC-safe transitions, or RT stage
+//   wait-time accounting) delegate to the out-of-line `wait_push_slow()` / `wait_pull_slow()` in `Adaptor_m_to_n.cpp`.
+inline void
+Adaptor_m_to_n::wait_push()
+{
+#ifndef SPU_FAST
+    if (SPU_TASK_UNLIKELY(this->tid_push < 0)) this->throw_invalid_pusher_error();
+#endif
+#ifndef SPU_JULIA
+    if (SPU_TASK_LIKELY(this->active_waiting && this->push_stage_start_ts_ptr == nullptr))
+    {
+        auto& ch = this->channels_ptr[this->cur_push_id];
+        const size_t cap = this->buffer_size;
+        std::atomic<bool>* const canceled_ptr = this->waiting_canceled_ptr;
+        const uint64_t w = ch.write_pos.load(std::memory_order_relaxed);
+        if (w - ch.read_pos_cache >= cap)
+        {
+            uint64_t r = ch.read_pos.load(std::memory_order_acquire);
+            while (w - r >= cap)
+            {
+                if (SPU_TASK_UNLIKELY(canceled_ptr->load(std::memory_order_relaxed)))
+                    throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
+                Adaptor_m_to_n::cpu_relax();
+                r = ch.read_pos.load(std::memory_order_acquire);
+            }
+            ch.read_pos_cache = r;
+        }
+        if (SPU_TASK_UNLIKELY(canceled_ptr->load(std::memory_order_relaxed)))
+            throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
+        return;
+    }
+#endif
+    this->wait_push_slow();
+}
+
+inline void
+Adaptor_m_to_n::wait_pull()
+{
+#ifndef SPU_FAST
+    if (SPU_TASK_UNLIKELY(this->tid_pull < 0)) this->throw_invalid_puller_error();
+#endif
+#ifndef SPU_JULIA
+    if (SPU_TASK_LIKELY(this->active_waiting && this->pull_stage_start_ts_ptr == nullptr))
+    {
+        auto& ch = this->channels_ptr[this->cur_pull_id];
+        std::atomic<bool>* const canceled_ptr = this->waiting_canceled_ptr;
+        const uint64_t r = ch.read_pos.load(std::memory_order_relaxed);
+        if (r == ch.write_pos_cache)
+        {
+            uint64_t w = ch.write_pos.load(std::memory_order_acquire);
+            while (r == w)
+            {
+                if (SPU_TASK_UNLIKELY(canceled_ptr->load(std::memory_order_relaxed)))
+                    throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
+                Adaptor_m_to_n::cpu_relax();
+                w = ch.write_pos.load(std::memory_order_acquire);
+            }
+            ch.write_pos_cache = w;
+        }
+        return;
+    }
+#endif
+    this->wait_pull_slow();
+}
+
+// Read-only slot accessors used in `copy` mode (or when `n_bound == 1`).
+// Guarded by `#ifndef SPU_FAST` so `-DSPU_FAST` builds skip the `*this->buffers_allocated` pointer dereference.
+inline void*
 Adaptor_m_to_n::get_empty_buffer(const size_t sid)
 {
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_empty_buffer()");
 #endif
     const auto& ch = this->channels_ptr[this->cur_push_id];
-    return (void*)ch.push_slots_base[ch.write_slot * this->n_sockets + sid];
+    return (void*)ch.push_read_slots[ch.write_slot * this->n_sockets + sid];
 }
 
-void*
+inline void*
 Adaptor_m_to_n::get_filled_buffer(const size_t sid)
 {
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_filled_buffer()");
 #endif
     const auto& ch = this->channels_ptr[this->cur_pull_id];
-    return (void*)ch.pull_slots_base[ch.read_slot * this->n_sockets + sid];
+    return (void*)ch.pull_read_slots[ch.read_slot * this->n_sockets + sid];
 }
 
-void*
+// Zero-copy buffer-exchange accessors used by `Sequence::apply_custom_process_rebind()`:
+// - `get_empty_buffer(sid, swap_buffer)` (called by Pusher): reads a recycled empty buffer from `ch.push_read_slots`
+//   (populated by Puller) and deposits the Pusher's newly filled `swap_buffer` into `ch.push_write_slots` (to be
+//   consumed by Puller).
+// - `get_filled_buffer(sid, swap_buffer)` (called by Puller): reads the filled buffer from `ch.pull_read_slots`
+//   (populated by Pusher) and deposits the Puller's consumed `swap_buffer` into `ch.pull_write_slots` (to be
+//   recycled by Pusher).
+inline void*
 Adaptor_m_to_n::get_empty_buffer(const size_t sid, void* swap_buffer)
 {
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_empty_buffer()");
 #endif
     const auto& ch = this->channels_ptr[this->cur_push_id];
-    int8_t*& slot_ref = ch.push_slots_base[ch.write_slot * this->n_sockets + sid];
-    void* empty_buffer = (void*)slot_ref;
-    slot_ref = (int8_t*)swap_buffer;
+    const size_t idx = ch.write_slot * this->n_sockets + sid;
+    void* empty_buffer = (void*)ch.push_read_slots[idx];
+    ch.push_write_slots[idx] = (int8_t*)swap_buffer;
     return empty_buffer;
 }
 
-void*
+inline void*
 Adaptor_m_to_n::get_filled_buffer(const size_t sid, void* swap_buffer)
 {
 #ifndef SPU_FAST
     if (SPU_TASK_UNLIKELY(!*this->buffers_allocated)) this->throw_unallocated_buffers_error("get_filled_buffer()");
 #endif
     const auto& ch = this->channels_ptr[this->cur_pull_id];
-    int8_t*& slot_ref = ch.pull_slots_base[ch.read_slot * this->n_sockets + sid];
-    void* filled_buffer = (void*)slot_ref;
-    slot_ref = (int8_t*)swap_buffer;
+    const size_t idx = ch.read_slot * this->n_sockets + sid;
+    void* filled_buffer = (void*)ch.pull_read_slots[idx];
+    ch.pull_write_slots[idx] = (int8_t*)swap_buffer;
     return filled_buffer;
 }
 

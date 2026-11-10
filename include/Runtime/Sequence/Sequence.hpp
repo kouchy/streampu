@@ -422,7 +422,7 @@ class Sequence
                               const std::vector<std::pair<runtime::Task*, runtime::Socket*>>& unbind_tasks);
 
   private:
-    static void apply_custom_process_rebind(Sub_sequence* contents, Task* task, const Custom_process_info& info);
+    static inline void apply_custom_process_rebind(Sub_sequence* contents, Task* task, const Custom_process_info& info);
     static inline void exec_subsequence(tools::Digraph_node<Sub_sequence>* cur_ss, std::vector<const int*>& statuses);
     static inline void exec_subsequence_without_statuses(tools::Digraph_node<Sub_sequence>* cur_ss);
     template<class SS, class TA>

@@ -654,13 +654,11 @@ main(int argc, char** argv)
     const bool has_julia = false;
 #endif
 
-    option longopts[] = {
-        { "n-exec", required_argument, NULL, 'e' },   { "data-length", required_argument, NULL, 'd' },
-        { "backends", required_argument, NULL, 'b' }, { "csv", required_argument, NULL, 'C' },
-        { "warmup", required_argument, NULL, 'W' },   { "rt-stats", no_argument, NULL, 'r' },
-        { "rt-skip", required_argument, NULL, 'R' },  { "rt-frames", no_argument, NULL, 'F' },
-        { "help", no_argument, NULL, 'h' },           { NULL, 0, NULL, 0 }
-    };
+    option longopts[] = { { "n-exec", required_argument, NULL, 'e' },   { "data-length", required_argument, NULL, 'd' },
+                          { "backends", required_argument, NULL, 'b' }, { "csv", required_argument, NULL, 'C' },
+                          { "warmup", required_argument, NULL, 'W' },   { "rt-stats", no_argument, NULL, 'r' },
+                          { "rt-skip", required_argument, NULL, 'R' },  { "rt-frames", no_argument, NULL, 'F' },
+                          { "help", no_argument, NULL, 'h' },           { NULL, 0, NULL, 0 } };
 
     size_t n_exec = 300000;
     size_t data_length = 64;

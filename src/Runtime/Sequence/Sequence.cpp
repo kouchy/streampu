@@ -827,16 +827,9 @@ Sequence::deallocate_outbuffers()
     }
 }
 
-// Outlined post-execution socket-rebinding helper for Switcher (select/commute) and Adaptor_m_to_n (pull/push) in
-// `no_copy_mode`. By separating this rebind logic from task execution, every task in `Sequence::exec_subsequence*`
-// executes the inlined `task->exec()` directly without `std::function<const int*()>`.
-#if defined(_MSC_VER)
-#define SPU_SEQ_NOINLINE __declspec(noinline)
-#else
-#define SPU_SEQ_NOINLINE __attribute__((noinline))
-#endif
-
-SPU_SEQ_NOINLINE void
+// Inlined post-execution socket-rebinding helper for Switcher (select/commute) and Adaptor_m_to_n (pull/push) in
+// `no_copy_mode`.
+inline void
 Sequence::apply_custom_process_rebind(Sub_sequence* contents, Task* task, const Custom_process_info& info)
 {
     const auto rebind_id = info.rebind_id;
@@ -870,7 +863,7 @@ Sequence::apply_custom_process_rebind(Sub_sequence* contents, Task* task, const 
             {
                 auto& scks = rebind_scks[sin_id];
                 const size_t n_bound = scks.size();
-                if (n_bound > 1)
+                if (SPU_TASK_LIKELY(n_bound > 1))
                 {
                     Socket* const* sck_ptrs = scks.data();
                     auto swap_buff = sck_ptrs[1]->_get_dataptr();
@@ -919,6 +912,18 @@ Sequence::apply_custom_process_rebind(Sub_sequence* contents, Task* task, const 
 // Calling a static function avoids std::function's indirect virtual call on every sub-sequence node, and invokes
 // the inlined `task->exec()` directly on `contents->tasks` (using `status_dataptr_ptr` instead of `sockets.back()`,
 // and `custom_processes` instead of `std::function<const int*()> processes` when `has_custom_processes` is true).
+//
+// Fused Zero-Copy Adaptor Fast Path (`ADAPTOR_PULL` / `ADAPTOR_PUSH` when `tsk->is_fast_exec` is true):
+// - In zero-copy mode (`no_copy_mode == true`), an `Adaptor_m_to_n::pull` or `Adaptor_m_to_n::push` task in fast mode
+//   (`tsk->is_fast_exec == true`, meaning `!debug && !stats && has_preallocated_frame`) only needs to:
+//     1) Wait for a filled/empty slot (`adp_pull->wait_pull()` / `adp_push->wait_push()`, inlined from
+//     `Adaptor_m_to_n.hxx`), 2) Increment `tsk->n_calls++`, and 3) Swap the socket buffer pointers and notify the peer
+//     stage (`Sequence::apply_custom_process_rebind()`).
+// - Invoking `wait_pull()` / `wait_push()` + `apply_custom_process_rebind()` directly here bypasses the indirect
+//   `Task::call_fast_codelet` function-pointer call inside `tsk->exec()` and eliminates the duplicate per-socket loop
+//   that previously ran inside the adaptor codelet before `apply_custom_process_rebind()`.
+// - When `!tsk->is_fast_exec` (e.g. debug printing or per-task duration stats enabled), execution falls back to the
+//   standard `tsk->exec(); Sequence::apply_custom_process_rebind(contents, tsk, info);` branch.
 inline void
 Sequence::exec_subsequence(tools::Digraph_node<Sub_sequence>* cur_ss, std::vector<const int*>& statuses)
 {
@@ -953,10 +958,32 @@ Sequence::exec_subsequence(tools::Digraph_node<Sub_sequence>* cur_ss, std::vecto
             const auto& custom = contents->custom_processes;
             for (size_t p = 0; p < tasks.size(); p++)
             {
-                tasks[p]->exec();
-                if (SPU_TASK_UNLIKELY(custom[p].type != process_t::STD))
-                    Sequence::apply_custom_process_rebind(contents, tasks[p], custom[p]);
-                statuses[tasks_id[p]] = (const int*)(*tasks[p]->status_dataptr_ptr);
+                Task* tsk = tasks[p];
+                const auto& info = custom[p];
+                if (info.type == process_t::STD)
+                {
+                    tsk->exec();
+                }
+                else if (info.type == process_t::ADAPTOR_PULL && SPU_TASK_LIKELY(tsk->is_fast_exec))
+                {
+                    auto* adp_pull = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
+                    adp_pull->wait_pull();
+                    tsk->n_calls++;
+                    Sequence::apply_custom_process_rebind(contents, tsk, info);
+                }
+                else if (info.type == process_t::ADAPTOR_PUSH && SPU_TASK_LIKELY(tsk->is_fast_exec))
+                {
+                    auto* adp_push = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
+                    adp_push->wait_push();
+                    tsk->n_calls++;
+                    Sequence::apply_custom_process_rebind(contents, tsk, info);
+                }
+                else
+                {
+                    tsk->exec();
+                    Sequence::apply_custom_process_rebind(contents, tsk, info);
+                }
+                statuses[tasks_id[p]] = (const int*)(*tsk->status_dataptr_ptr);
             }
         }
         for (auto* c : cur_ss->get_children())
@@ -992,9 +1019,31 @@ Sequence::exec_subsequence_without_statuses(tools::Digraph_node<Sub_sequence>* c
             const auto& custom = contents->custom_processes;
             for (size_t p = 0; p < tasks.size(); p++)
             {
-                tasks[p]->exec();
-                if (SPU_TASK_UNLIKELY(custom[p].type != process_t::STD))
-                    Sequence::apply_custom_process_rebind(contents, tasks[p], custom[p]);
+                Task* tsk = tasks[p];
+                const auto& info = custom[p];
+                if (info.type == process_t::STD)
+                {
+                    tsk->exec();
+                }
+                else if (info.type == process_t::ADAPTOR_PULL && SPU_TASK_LIKELY(tsk->is_fast_exec))
+                {
+                    auto* adp_pull = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
+                    adp_pull->wait_pull();
+                    tsk->n_calls++;
+                    Sequence::apply_custom_process_rebind(contents, tsk, info);
+                }
+                else if (info.type == process_t::ADAPTOR_PUSH && SPU_TASK_LIKELY(tsk->is_fast_exec))
+                {
+                    auto* adp_push = static_cast<module::Adaptor_m_to_n*>(info.module_ptr);
+                    adp_push->wait_push();
+                    tsk->n_calls++;
+                    Sequence::apply_custom_process_rebind(contents, tsk, info);
+                }
+                else
+                {
+                    tsk->exec();
+                    Sequence::apply_custom_process_rebind(contents, tsk, info);
+                }
             }
         }
         for (auto* c : cur_ss->get_children())
@@ -1278,7 +1327,10 @@ Sequence::_exec_without_statuses(const size_t tid,
 void
 Sequence::exec(std::function<bool(const std::vector<const int*>&)> stop_condition)
 {
-    if (this->is_no_copy_mode()) this->gen_processes(true);
+    // When this Sequence is a stage inside a `Pipeline` (`this->is_part_of_pipeline == true`), `Pipeline::exec()`
+    // already calls `stage->gen_processes(true)` on all stages before starting the worker threads (just as it calls
+    // `stage->gen_processes(false)` on all stages after `thread_pool->wait()`).
+    if (this->is_no_copy_mode() && !this->is_part_of_pipeline) this->gen_processes(true);
 
     // Only wrap stop_condition with this->is_done() when the sequence actually contains modules implementing
     // Interface_is_done (!this->donners.empty()); otherwise this->is_done() always returns false and wrapping
@@ -1337,7 +1389,9 @@ Sequence::exec(std::function<bool(const std::vector<const int*>&)> stop_conditio
 void
 Sequence::exec(std::function<bool()> stop_condition)
 {
-    if (this->is_no_copy_mode()) this->gen_processes(true);
+    // When this Sequence is a stage inside a `Pipeline` (`this->is_part_of_pipeline == true`), `Pipeline::exec()`
+    // already calls `stage->gen_processes(true)` on all stages before starting the worker threads.
+    if (this->is_no_copy_mode() && !this->is_part_of_pipeline) this->gen_processes(true);
 
     std::function<bool()> real_stop_condition;
     if (this->auto_stop && !this->donners.empty())
@@ -2558,6 +2612,15 @@ Sequence::gen_processes(const bool no_copy_mode)
         }
     };
 
+    // Pin each thread `thread_id` before running `gen_processes_recursive` and unpin afterwards for two reasons:
+    // 1. NUMA & L1/L2 Cache First-Touch Policy: `gen_processes_recursive` allocates and populates the per-thread
+    //    `custom_processes`, `rebind_sockets`, and `rebind_dataptrs` vectors inside each `Sub_sequence` node of
+    //    `this->sequences[thread_id]`. Pinning the thread to `puids[thread_id]` / `pin_objects_per_thread[thread_id]`
+    //    ensures those memory pages and cache lines are first-touched on the target physical core / NUMA node.
+    // 2. Unpinning Invariant of `Sequence::init()`: `Sequence::init()` pins the calling thread to thread 0 at the
+    //    start of initialization (`Sequence.cpp:479`) and relies on `this->gen_processes()` (`Sequence.cpp:591`) to
+    //    call `Thread_pinning::unpin()` at the end of this loop (especially when `n_threads == 1` and `tasks_inplace`,
+    //    where `Sequence::replicate()` does not execute its `tid < n_threads - 1` loops).
     size_t thread_id = 0;
     for (auto& sequence : this->sequences)
     {

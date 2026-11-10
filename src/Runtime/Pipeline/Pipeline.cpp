@@ -1278,6 +1278,15 @@ Pipeline::exec(const std::vector<std::function<bool(const std::vector<const int*
             }
     };
 
+    // Configure zero-copy processes (`stage->gen_processes(true)`) across ALL pipeline stages BEFORE launching the
+    // worker threads (`thread_pool->run`). Symmetric with the `stage->gen_processes(false)` loop at the end of
+    // `Pipeline::exec()`, this guarantees that both ends of every inter-stage `Adaptor_m_to_n`
+    // (`set_no_copy_push(true)` on upstream stage `s` and `set_no_copy_pull(true)` on downstream stage `s + 1`, setting
+    // `*shared_no_copy_flags == 0x3`) and all stages' initial `rebind_dataptrs` are initialized before any stage thread
+    // starts pushing or pulling frames.
+    for (auto& stage : this->stages)
+        if (stage->is_no_copy_mode()) stage->gen_processes(true);
+
     uint64_t t_start_tsc = 0;
     std::chrono::steady_clock::time_point t_start_clock;
     if (this->rt_stats)
@@ -1375,6 +1384,15 @@ Pipeline::exec(const std::vector<std::function<bool()>>& stop_conditions)
                     if (tasks[th][ta]->get_name().find("pull") != std::string::npos) m->cancel_waiting();
             }
     };
+
+    // Configure zero-copy processes (`stage->gen_processes(true)`) across ALL pipeline stages BEFORE launching the
+    // worker threads (`thread_pool->run`). Symmetric with the `stage->gen_processes(false)` loop at the end of
+    // `Pipeline::exec()`, this guarantees that both ends of every inter-stage `Adaptor_m_to_n`
+    // (`set_no_copy_push(true)` on upstream stage `s` and `set_no_copy_pull(true)` on downstream stage `s + 1`, setting
+    // `*shared_no_copy_flags == 0x3`) and all stages' initial `rebind_dataptrs` are initialized before any stage thread
+    // starts pushing or pulling frames.
+    for (auto& stage : this->stages)
+        if (stage->is_no_copy_mode()) stage->gen_processes(true);
 
     uint64_t t_start_tsc = 0;
     std::chrono::steady_clock::time_point t_start_clock;

@@ -40,6 +40,7 @@ Adaptor_m_to_n::deep_copy(const Adaptor_m_to_n& m)
     this->cloned = true;
     (*this->n_clones)++;
     this->channels_ptr = this->channels->data();
+    this->waiting_canceled_ptr = this->waiting_canceled.get();
     this->tid_push = -1;
     this->tid_pull = -1;
     this->cur_push_id = -1;
@@ -79,6 +80,7 @@ Adaptor_m_to_n::alloc_buffers()
 
     const size_t stride = this->buffer_size * this->n_sockets;
     this->buffer->resize(ppcm * stride, nullptr);
+    this->return_buffer->resize(ppcm * stride, nullptr);
     this->ts_buffer->resize(ppcm, std::vector<uint64_t>(this->buffer_size, 0));
 
     if (this->buffer_to_free.size())
@@ -88,25 +90,39 @@ Adaptor_m_to_n::alloc_buffers()
         throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
     }
 
+    // Allocate one 64-byte aligned buffer per (sub-channel `d`, ring slot `b`, socket `s`) and initialize all slot
+    // tables (`this->buffer`, `this->return_buffer`, and when `stride <= 2`, the inline cache-line-local arrays
+    // `ch.inline_forward_slots` and `ch.inline_return_slots`) with the same initial pointer `ptr`.
+    // In dual zero-copy mode (`no_copy_push && no_copy_pull`), `return_buffer` / `inline_return_slots` supply the
+    // initial empty buffer(s) to the Pusher during the first `buffer_size` frames, while the Pusher deposits its
+    // filled buffers into `buffer` / `inline_forward_slots` for the Puller.
     for (size_t d = 0; d < ppcm; d++)
     {
+        auto& ch = this->channels_ptr[d];
+        ch.reset();
         for (size_t b = 0; b < this->buffer_size; b++)
             for (size_t s = 0; s < this->n_sockets; s++)
             {
+                const size_t k = b * this->n_sockets + s;
                 int8_t* ptr = tools::buffer_alloc<int8_t>(this->n_frames * this->n_bytes[s]);
-                (*this->buffer)[(d * this->buffer_size + b) * this->n_sockets + s] = ptr;
+                (*this->buffer)[d * stride + k] = ptr;
+                (*this->return_buffer)[d * stride + k] = ptr;
+                if (stride <= 2)
+                {
+                    ch.inline_forward_slots[k] = ptr;
+                    ch.inline_return_slots[k] = ptr;
+                }
                 this->buffer_to_free.push_back(ptr);
             }
-        auto& ch = this->channels_ptr[d];
-        ch.reset();
-        ch.push_slots_base = &(*this->buffer)[d * stride];
-        ch.pull_slots_base = &(*this->buffer)[d * stride];
-        ch.push_ts_base = (*this->ts_buffer)[d].data();
-        ch.pull_ts_base = (*this->ts_buffer)[d].data();
+        // When `buffer_size <= 2`, embed the per-slot birth timestamp ring directly inside `ch.inline_ts` on the
+        // Pusher's cache line to avoid an extra heap indirection (`(*this->ts_buffer)[d]`) during E2E RT stats.
+        ch.push_ts_base = (this->buffer_size <= 2) ? ch.inline_ts : (*this->ts_buffer)[d].data();
+        ch.pull_ts_base = ch.push_ts_base;
         ch.push_n_channels = static_cast<uint32_t>(ppcm);
         ch.pull_n_channels = static_cast<uint32_t>(ppcm);
     }
 
+    this->update_slot_pointers();
     *this->buffers_allocated = true;
 }
 
@@ -165,25 +181,59 @@ Adaptor_m_to_n::reset()
     this->reset_buffer();
 }
 
+// `shared_no_copy_flags` is shared via `std::shared_ptr<uint8_t>` across the original adaptor and all its clones:
+// - Bit 0 (`0x1`): `no_copy_push` is enabled on the upstream Pusher side.
+// - Bit 1 (`0x2`): `no_copy_pull` is enabled on the downstream Puller side.
+// Whenever either flag changes, `update_slot_pointers()` rewires the per-channel `push_read_slots`/`push_write_slots`
+// and `pull_read_slots`/`pull_write_slots` to use unidirectional dual tables (`inline_forward_slots` +
+// `inline_return_slots` or `buffer` + `return_buffer`) iff both bits are set (`0x3`).
 void
 Adaptor_m_to_n::set_no_copy_pull(const bool no_copy_pull)
 {
     this->no_copy_pull = no_copy_pull;
+    if (no_copy_pull)
+        *this->shared_no_copy_flags |= 0x2;
+    else
+        *this->shared_no_copy_flags &= ~uint8_t(0x2);
+    this->update_slot_pointers();
 }
 
 void
 Adaptor_m_to_n::set_no_copy_push(const bool no_copy_push)
 {
     this->no_copy_push = no_copy_push;
+    if (no_copy_push)
+        *this->shared_no_copy_flags |= 0x1;
+    else
+        *this->shared_no_copy_flags &= ~uint8_t(0x1);
+    this->update_slot_pointers();
 }
 
+// Restores all slot tables (`buffer`, `return_buffer`, `inline_forward_slots`, `inline_return_slots`) to the original
+// adaptor-owned buffers stored in `buffer_to_free`. Called at the end of `Pipeline::exec()` after
+// `stage->reset_no_copy_mode()` has restored every stage socket's initial `dataptr`.
 void
 Adaptor_m_to_n::reset_buffer()
 {
     if (!this->cloned && *this->buffers_allocated)
     {
-        for (size_t i = 0; i < this->buffer_to_free.size(); i++)
-            (*this->buffer)[i] = this->buffer_to_free[i];
+        const size_t stride = this->buffer_size * this->n_sockets;
+        const size_t n_ch = this->channels_ptr[0].push_n_channels;
+        for (size_t d = 0; d < n_ch; d++)
+        {
+            auto& ch = this->channels_ptr[d];
+            for (size_t k = 0; k < stride; k++)
+            {
+                int8_t* ptr = this->buffer_to_free[d * stride + k];
+                (*this->buffer)[d * stride + k] = ptr;
+                (*this->return_buffer)[d * stride + k] = ptr;
+                if (stride <= 2)
+                {
+                    ch.inline_forward_slots[k] = ptr;
+                    ch.inline_return_slots[k] = ptr;
+                }
+            }
+        }
     }
 }
 
@@ -196,15 +246,23 @@ Adaptor_m_to_n::set_n_frames(const size_t n_frames)
         Module::set_n_frames(n_frames);
         if (!this->cloned && *this->buffers_allocated)
         {
+            const size_t stride = this->buffer_size * this->n_sockets;
             const size_t n_ch = this->channels_ptr[0].push_n_channels;
             for (size_t d = 0; d < n_ch; d++)
                 for (size_t b = 0; b < this->buffer_size; b++)
                     for (size_t s = 0; s < this->n_sockets; s++)
                     {
-                        const size_t idx = (d * this->buffer_size + b) * this->n_sockets + s;
+                        const size_t k = b * this->n_sockets + s;
+                        const size_t idx = d * stride + k;
                         auto old_ptr = (*this->buffer)[idx];
                         int8_t* new_ptr = tools::buffer_alloc<int8_t>(this->n_bytes[s] * n_frames);
                         (*this->buffer)[idx] = new_ptr;
+                        (*this->return_buffer)[idx] = new_ptr;
+                        if (stride <= 2)
+                        {
+                            this->channels_ptr[d].inline_forward_slots[k] = new_ptr;
+                            this->channels_ptr[d].inline_return_slots[k] = new_ptr;
+                        }
 
                         bool found = false;
                         for (size_t bf = 0; bf < this->buffer_to_free.size(); bf++)
@@ -262,14 +320,9 @@ Adaptor_m_to_n::pull(runtime::Task& t, const size_t base_sck, const size_t /*fra
 }
 
 void
-Adaptor_m_to_n::wait_push()
+Adaptor_m_to_n::wait_push_slow()
 {
-    if (this->tid_push < 0)
-    {
-        std::stringstream message;
-        message << "This instance is not a pusher.";
-        throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
-    }
+    if (this->tid_push < 0) this->throw_invalid_pusher_error();
 
     // When the inter-stage buffer is full, a thread registered with the Julia runtime ('jl_get_pgcstack() != nullptr')
     // must enter GC_SAFE before blocking (active spin-wait or passive condition_variable wait) so that another pipeline
@@ -344,14 +397,9 @@ Adaptor_m_to_n::wait_push()
 }
 
 void
-Adaptor_m_to_n::wait_pull()
+Adaptor_m_to_n::wait_pull_slow()
 {
-    if (this->tid_pull < 0)
-    {
-        std::stringstream message;
-        message << "This instance is not a puller.";
-        throw tools::runtime_error(__FILE__, __LINE__, __func__, message.str());
-    }
+    if (this->tid_pull < 0) this->throw_invalid_puller_error();
 
     // When the inter-stage buffer is empty, enter GC_SAFE if this thread is registered with the Julia runtime
     // ('jl_get_pgcstack() != nullptr') so upstream Julia stages can run a Stop-The-World GC cycle without deadlocking.
@@ -430,6 +478,22 @@ Adaptor_m_to_n::throw_unallocated_buffers_error(const char* func_name) const
     std::stringstream message;
     message << "You need to call 'alloc_buffers()' before to change '" << func_name << "'.";
     throw tools::runtime_error(__FILE__, __LINE__, func_name, message.str());
+}
+
+[[noreturn]] void
+Adaptor_m_to_n::throw_invalid_pusher_error() const
+{
+    std::stringstream message;
+    message << "This instance is not a pusher.";
+    throw tools::runtime_error(__FILE__, __LINE__, "wait_push", message.str());
+}
+
+[[noreturn]] void
+Adaptor_m_to_n::throw_invalid_puller_error() const
+{
+    std::stringstream message;
+    message << "This instance is not a puller.";
+    throw tools::runtime_error(__FILE__, __LINE__, "wait_pull", message.str());
 }
 
 void
