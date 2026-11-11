@@ -160,6 +160,11 @@ class Sequence
       pipeline_inter_rt_stats_per_thread;     // per-thread inter-frame wall-clock period at pipeline output
     std::vector<uint64_t> cur_frame_birth_ts; // per-thread birth timestamp of the current frame in stage 0
     std::vector<uint64_t> cur_stage_start_ts; // per-thread start timestamp of the current stage execution
+    // Source pacing (emulated ADC, stage 0 only): when > 0, each stage-0 execution starts at the absolute deadline
+    // t_start + i * period (busy-wait) and the frame birth timestamp is set to that nominal arrival time, so that the
+    // End-to-End latency includes any queueing delay caused by a late pipeline (enabled via `set_rt_pacing()`).
+    double rt_pacing_period_ns = 0.0;
+    double rt_pacing_period_ticks = 0.0;
 
   public:
     Sequence(const std::vector<const runtime::Task*>& firsts,
@@ -349,6 +354,14 @@ class Sequence
     const std::vector<tools::Rt_stats>& get_pipeline_e2e_rt_stats_per_thread() const;
     const std::vector<tools::Rt_stats>& get_pipeline_inter_rt_stats_per_thread() const;
     double get_rt_ns_per_tick() const;
+
+    /*!
+     * \brief Paces the executions of this Sequence (Pipeline stage 0) at a fixed period, emulating a sampled source.
+     * Only effective while RT statistics are enabled. The birth timestamp of each frame is its nominal arrival time.
+     * \param period_ns: period between two executions in nanoseconds (0 disables pacing).
+     */
+    void set_rt_pacing(const double period_ns);
+    double get_rt_pacing() const;
 
     inline size_t get_n_frames() const;
     void set_n_frames(const size_t n_frames);

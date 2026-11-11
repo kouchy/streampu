@@ -1693,6 +1693,18 @@ Pipeline::get_rt_stats_skip_frames() const
 }
 
 void
+Pipeline::set_rt_pacing(const double period_ns)
+{
+    if (!this->stages.empty()) this->stages[0]->set_rt_pacing(period_ns);
+}
+
+double
+Pipeline::get_rt_pacing() const
+{
+    return this->stages.empty() ? 0.0 : this->stages[0]->get_rt_pacing();
+}
+
+void
 Pipeline::reset_rt_stats()
 {
     for (auto& stage : this->stages)

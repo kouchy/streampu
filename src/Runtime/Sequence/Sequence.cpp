@@ -1112,6 +1112,8 @@ Sequence::_exec(const size_t tid,
             uint64_t& stage_start_ts = this->cur_stage_start_ts[tid];
             const bool set_birth = (!this->is_part_of_pipeline || this->is_first_pipeline_stage);
             const bool record_e2e = this->is_last_pipeline_stage;
+            const double pace_period = set_birth ? this->rt_pacing_period_ticks : 0.0;
+            double pace_next = 0.0;
             do
             {
                 // force switchers reset to reinitialize the path to the last input socket
@@ -1119,9 +1121,21 @@ Sequence::_exec(const size_t tid,
                     swi_reset[s]->reset();
 
                 std::fill(statuses.begin(), statuses.end(), nullptr);
-                const uint64_t t0 = tools::read_tsc();
+                uint64_t t0 = tools::read_tsc();
+                uint64_t birth = t0;
+                if (pace_period > 0.0)
+                {
+                    // emulated sampled source: wait for the absolute deadline of this wave (no drift), and date the
+                    // frame at its nominal arrival time (if the pipeline is late, the delay counts in the E2E latency)
+                    if (pace_next == 0.0) pace_next = (double)t0;
+                    const uint64_t deadline = (uint64_t)pace_next;
+                    while (t0 < deadline)
+                        t0 = tools::read_tsc();
+                    birth = deadline;
+                    pace_next += pace_period;
+                }
                 stage_start_ts = t0;
-                if (set_birth) birth_ts = t0;
+                if (set_birth) birth_ts = birth;
                 bool aborted = false;
                 try
                 {
@@ -1248,15 +1262,29 @@ Sequence::_exec_without_statuses(const size_t tid,
             uint64_t& stage_start_ts = this->cur_stage_start_ts[tid];
             const bool set_birth = (!this->is_part_of_pipeline || this->is_first_pipeline_stage);
             const bool record_e2e = this->is_last_pipeline_stage;
+            const double pace_period = set_birth ? this->rt_pacing_period_ticks : 0.0;
+            double pace_next = 0.0;
             do
             {
                 // force switchers reset to reinitialize the path to the last input socket
                 for (size_t s = 0; s < swi_reset.size(); s++)
                     swi_reset[s]->reset();
 
-                const uint64_t t0 = tools::read_tsc();
+                uint64_t t0 = tools::read_tsc();
+                uint64_t birth = t0;
+                if (pace_period > 0.0)
+                {
+                    // emulated sampled source: wait for the absolute deadline of this wave (no drift), and date the
+                    // frame at its nominal arrival time (if the pipeline is late, the delay counts in the E2E latency)
+                    if (pace_next == 0.0) pace_next = (double)t0;
+                    const uint64_t deadline = (uint64_t)pace_next;
+                    while (t0 < deadline)
+                        t0 = tools::read_tsc();
+                    birth = deadline;
+                    pace_next += pace_period;
+                }
                 stage_start_ts = t0;
-                if (set_birth) birth_ts = t0;
+                if (set_birth) birth_ts = birth;
                 bool aborted = false;
                 try
                 {
@@ -3130,6 +3158,30 @@ const std::vector<tools::Rt_stats>&
 Sequence::get_pipeline_inter_rt_stats_per_thread() const
 {
     return this->pipeline_inter_rt_stats_per_thread;
+}
+
+void
+Sequence::set_rt_pacing(const double period_ns)
+{
+    this->rt_pacing_period_ns = period_ns > 0.0 ? period_ns : 0.0;
+    this->rt_pacing_period_ticks = 0.0;
+    if (this->rt_pacing_period_ns > 0.0)
+    {
+        // calibrate the tick rate of `tools::read_tsc()` against the wall clock (20 ms, error << 0.1%)
+        const auto w0 = std::chrono::steady_clock::now();
+        const uint64_t c0 = tools::read_tsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const uint64_t c1 = tools::read_tsc();
+        const auto w1 = std::chrono::steady_clock::now();
+        const double dt_ns = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(w1 - w0).count();
+        if (c1 > c0 && dt_ns > 0.0) this->rt_pacing_period_ticks = this->rt_pacing_period_ns * (double)(c1 - c0) / dt_ns;
+    }
+}
+
+double
+Sequence::get_rt_pacing() const
+{
+    return this->rt_pacing_period_ns;
 }
 
 double
