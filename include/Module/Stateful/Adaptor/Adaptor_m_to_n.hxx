@@ -314,7 +314,7 @@ Adaptor_m_to_n::wait_push()
             uint64_t r = ch.read_pos.load(std::memory_order_acquire);
             while (w - r >= cap)
             {
-                if (SPU_TASK_UNLIKELY(canceled_ptr->load(std::memory_order_relaxed)))
+                if (SPU_TASK_UNLIKELY(canceled_ptr->load(std::memory_order_acquire)))
                     throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
                 Adaptor_m_to_n::cpu_relax();
                 r = ch.read_pos.load(std::memory_order_acquire);
@@ -346,8 +346,14 @@ Adaptor_m_to_n::wait_pull()
             uint64_t w = ch.write_pos.load(std::memory_order_acquire);
             while (r == w)
             {
-                if (SPU_TASK_UNLIKELY(canceled_ptr->load(std::memory_order_relaxed)))
-                    throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
+                if (SPU_TASK_UNLIKELY(canceled_ptr->load(std::memory_order_acquire)))
+                {
+                    // Stop only if the channel is still empty: a frame published just before the cancellation
+                    // (the last frame of the stream, by construction) must be consumed, not dropped.
+                    w = ch.write_pos.load(std::memory_order_acquire);
+                    if (r == w) throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
+                    break;
+                }
                 Adaptor_m_to_n::cpu_relax();
                 w = ch.write_pos.load(std::memory_order_acquire);
             }

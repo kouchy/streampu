@@ -720,6 +720,13 @@ if(SPU_TESTS)
     set_tests_properties(pipeline7::spu-test-simple-pipeline PROPERTIES LABELS simple-pipeline)
     add_test(NAME pipeline8::spu-test-simple-pipeline COMMAND spu-test-simple-pipeline -i ${INPUT_FILE} -u 17 -f 5 -k)
     set_tests_properties(pipeline8::spu-test-simple-pipeline PROPERTIES LABELS simple-pipeline)
+    # Regression (frames lost at shutdown by the inlined active-waiting pull fast path, only compiled without Julia):
+    # small frames (36 frames from INPUT_FILE) spread over 14 relay threads that are all spin-waiting when the source
+    # finishes. Before the fix: pipeline9 failed 30/30 runs and pipeline10 26/30 runs (macOS ARM64).
+    add_test(NAME pipeline9::spu-test-simple-pipeline COMMAND spu-test-simple-pipeline -i ${INPUT_FILE} -t 14 -w -d 64 -s 0)
+    set_tests_properties(pipeline9::spu-test-simple-pipeline PROPERTIES LABELS "simple-pipeline;skip-memcheck")
+    add_test(NAME pipeline10::spu-test-simple-pipeline COMMAND spu-test-simple-pipeline -i ${INPUT_FILE} -t 14 -w -d 64)
+    set_tests_properties(pipeline10::spu-test-simple-pipeline PROPERTIES LABELS "simple-pipeline;skip-memcheck")
 
     # probes
     add_test(NAME sequence0::spu-test-pipeline-probe COMMAND spu-test-pipeline-probe -q -t 1 -i ${INPUT_FILE})

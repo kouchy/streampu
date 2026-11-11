@@ -163,7 +163,8 @@ Adaptor_m_to_n::add_puller()
 void
 Adaptor_m_to_n::send_cancel_signal()
 {
-    this->waiting_canceled->store(true, std::memory_order_relaxed);
+    // release: a puller that observes the cancellation (acquire) also observes every frame published before it
+    this->waiting_canceled->store(true, std::memory_order_release);
 }
 
 void
@@ -462,7 +463,7 @@ Adaptor_m_to_n::wait_pull_slow()
     }
 
     // Check the cheap `relaxed` cancellation flag first so `is_empty()` is not re-evaluated on every normal frame.
-    if (this->waiting_canceled->load(std::memory_order_relaxed) && this->is_empty(this->cur_pull_id))
+    if (this->waiting_canceled->load(std::memory_order_acquire) && this->is_empty(this->cur_pull_id))
         throw tools::waiting_canceled(__FILE__, __LINE__, __func__);
 
     // When Real-Time pipeline statistics are enabled, record the exact timestamp at which `wait_pull()` unblocks
