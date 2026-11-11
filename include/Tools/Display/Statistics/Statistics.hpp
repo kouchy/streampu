@@ -46,12 +46,15 @@ read_tsc() noexcept
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     return __rdtsc();
 #elif defined(__x86_64__) || defined(__i386__)
-    uint32_t lo, hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    // Serialized read: `rdtscp` waits until all previous instructions have executed, and the trailing `lfence`
+    // prevents later instructions from starting before the counter is read (plain `rdtsc` can be reordered).
+    uint32_t lo, hi, aux;
+    __asm__ __volatile__("rdtscp\n\tlfence" : "=a"(lo), "=d"(hi), "=c"(aux) : : "memory");
     return (static_cast<uint64_t>(hi) << 32) | lo;
 #elif defined(__aarch64__)
+    // `isb` flushes the pipeline so that the counter read is not speculated before previous instructions.
     uint64_t val;
-    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+    __asm__ __volatile__("isb\n\tmrs %0, cntvct_el0" : "=r"(val) : : "memory");
     return val;
 #elif defined(__arm__) && defined(__ARM_ARCH) && (__ARM_ARCH >= 8)
     uint32_t lo, hi;
@@ -78,17 +81,17 @@ read_tsc() noexcept
 }
 
 // High-Dynamic-Range (HDR) sub-bucketed base-2 histogram and online accumulator for Real-Time (RT) latency & jitter.
-// Uses 64 linear sub-buckets per power-of-2 octave (`SUB_BITS = 6`, 2048 buckets = 8 KB total, fitting inside L1d
+// Uses 128 linear sub-buckets per power-of-2 octave (`SUB_BITS = 7`, 4096 buckets = 16 KB total, fitting inside L1d
 // cache):
-// - Values in `[0..127]` ticks are mapped with exact 1-tick resolution.
-// - Values `>= 128` ticks are mapped with `<= 0.78%` relative quantization error up to `2^37` ticks.
+// - Values in `[0..255]` ticks are mapped with exact 1-tick resolution.
+// - Values `>= 256` ticks are mapped with `<= 0.39%` relative quantization error up to `2^38` ticks.
 // Recording a sample in the hot loop requires no heap allocation, no branches, and no floating-point division.
 struct Rt_stats
 {
-    static constexpr size_t SUB_BITS = 6;
-    static constexpr size_t SUB_COUNT = (size_t)1 << SUB_BITS; // 64
-    static constexpr size_t LINEAR_LIMIT = SUB_COUNT * 2;      // 128
-    static constexpr size_t N_BUCKETS = 2048;
+    static constexpr size_t SUB_BITS = 7;
+    static constexpr size_t SUB_COUNT = (size_t)1 << SUB_BITS; // 128
+    static constexpr size_t LINEAR_LIMIT = SUB_COUNT * 2;      // 256
+    static constexpr size_t N_BUCKETS = 4096;
 
     uint64_t n_calls;
     uint64_t tot_ticks;
