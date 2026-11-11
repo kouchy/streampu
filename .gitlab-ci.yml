@@ -76,7 +76,9 @@ analysis-clang-format:
   image: ubuntu:22.04
   script:
     - apt update
-    - apt -y install clang-format
+    - apt -y install python3-pip
+    - python3 -m pip install "clang-format==$(tr -d '[:space:]' < .clang-format-version)"
+    - clang-format --version
     - mkdir original_code
     - cp -r include original_code
     - cp -r src original_code

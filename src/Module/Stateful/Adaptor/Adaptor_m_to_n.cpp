@@ -384,7 +384,8 @@ Adaptor_m_to_n::wait_push_slow()
                 std::unique_lock<std::mutex> lock((*this->mtx_push.get())[this->cur_push_id]);
                 ((*this->cnd_push.get())[this->cur_push_id])
                   .wait(lock,
-                        [this]() {
+                        [this]()
+                        {
                             return !(this->is_full(this->cur_push_id) &&
                                      !this->waiting_canceled->load(std::memory_order_relaxed));
                         });
@@ -451,7 +452,8 @@ Adaptor_m_to_n::wait_pull_slow()
                 std::unique_lock<std::mutex> lock((*this->mtx_pull.get())[this->cur_pull_id]);
                 ((*this->cnd_pull.get())[this->cur_pull_id])
                   .wait(lock,
-                        [this]() {
+                        [this]()
+                        {
                             return !(this->is_empty(this->cur_pull_id) &&
                                      !this->waiting_canceled->load(std::memory_order_relaxed));
                         });

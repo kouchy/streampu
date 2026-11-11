@@ -613,7 +613,7 @@ template<size_t I>
 static inline typename std::enable_if<(I > Module_Julia::SPU_MAX_DIRECT_TRAMPOLINE_ARGS), int32_t>::type
 invoke_trampoline(void* cfunc, void* const* a, const uint32_t fid, const uint32_t nfw, const size_t /*n_obj_args*/)
 {
-    return ((int32_t(*)(void* const*, uint32_t, uint32_t))cfunc)(a, fid, nfw);
+    return ((int32_t (*)(void* const*, uint32_t, uint32_t))cfunc)(a, fid, nfw);
 }
 
 // Recursive compile-time dispatch for `0 <= n_obj_args <= SPU_MAX_DIRECT_TRAMPOLINE_ARGS`.
@@ -644,7 +644,7 @@ rethrow_julia_exception()
 static SPU_NOINLINE int32_t
 invoke_safe_trampoline(void* safe_cfunc, void* const* a, const uint32_t fid, const uint32_t nfw)
 {
-    const int64_t ret = ((int64_t(*)(void* const*, uint32_t, uint32_t))safe_cfunc)(a, fid, nfw);
+    const int64_t ret = ((int64_t (*)(void* const*, uint32_t, uint32_t))safe_cfunc)(a, fid, nfw);
     if (SPU_UNLIKELY((ret >> 32) != 0)) rethrow_julia_exception();
     return (int32_t)ret;
 }

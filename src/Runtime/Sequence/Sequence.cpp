@@ -3174,7 +3174,8 @@ Sequence::set_rt_pacing(const double period_ns)
         const uint64_t c1 = tools::read_tsc();
         const auto w1 = std::chrono::steady_clock::now();
         const double dt_ns = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(w1 - w0).count();
-        if (c1 > c0 && dt_ns > 0.0) this->rt_pacing_period_ticks = this->rt_pacing_period_ns * (double)(c1 - c0) / dt_ns;
+        if (c1 > c0 && dt_ns > 0.0)
+            this->rt_pacing_period_ticks = this->rt_pacing_period_ns * (double)(c1 - c0) / dt_ns;
     }
 }
 

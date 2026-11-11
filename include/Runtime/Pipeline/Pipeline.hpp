@@ -223,9 +223,11 @@ class Pipeline : public tools::Interface_get_set_n_frames
     void reset_rt_stats();
 
     /*!
-     * \brief Paces the first stage at a fixed period (emulated sampled source, e.g. an ADC delivering one wave of
-     *        `n_frames` frames every `period_ns`). Only effective while RT statistics are enabled; the End-to-End latency
-     *        is then measured from the nominal arrival time of each wave (0 disables pacing).
+     * \brief Paces the first stage at a fixed period (emulated sampled source, e.g. an ADC).
+     *
+     * One wave of `n_frames` frames enters the pipeline every `period_ns` nanoseconds (0 disables pacing). Only
+     * effective while RT statistics are enabled: the End-to-End latency is then measured from the nominal arrival
+     * time of each wave.
      */
     void set_rt_pacing(const double period_ns);
     double get_rt_pacing() const;

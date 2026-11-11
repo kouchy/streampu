@@ -25,10 +25,12 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-      - name: Install clang-format
+      - name: Install clang-format (version pinned in .clang-format-version)
         run: |
           apt-get update
-          apt-get -y install clang-format
+          apt-get -y install python3-pip
+          python3 -m pip install "clang-format==$(tr -d '[:space:]' < .clang-format-version)"
+          clang-format --version
         shell: bash
       - name: Invoke clang-format on the source code & Compare
         run: |

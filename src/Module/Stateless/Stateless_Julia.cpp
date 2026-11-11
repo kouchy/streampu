@@ -7,10 +7,7 @@ using namespace spu::module;
 
 Stateless_Julia::Stateless_Julia(const bool jl_safe)
   : Stateless()
-  , Module_Julia(
-      this,
-      [](Module& m) -> Module_Julia& { return static_cast<Stateless_Julia&>(m); },
-      jl_safe)
+  , Module_Julia(this, [](Module& m) -> Module_Julia& { return static_cast<Stateless_Julia&>(m); }, jl_safe)
 {
     const std::string name = "Stateless_Julia";
     this->set_name(name);
