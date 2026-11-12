@@ -1625,6 +1625,7 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
 
     bool is_last = true;
     tools::Digraph_node<SS>* last_subseq = nullptr;
+    size_t current_task_id = 0; // id given to 'current_task' in its sub-sequence
 
     if (auto switcher = dynamic_cast<const module::Switcher*>(&current_task.get_module()))
     {
@@ -1637,6 +1638,7 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
 
             node_commute->set_contents(new SS());
             node_commute->get_c()->tasks.push_back(&current_task);
+            current_task_id = taid;
             node_commute->get_c()->tasks_id.push_back(taid++);
             node_commute->get_c()->type = subseq_t::COMMUTE;
             ssid++;
@@ -1671,6 +1673,9 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
                                                                       t.get_n_static_input_sockets()) ||
                             (t_is_select && t.is_last_input_socket(*bs)))
                         {
+                            // a 'select' reached by its last input follows the path being explored, not the
+                            // sub-sequence recorded for its previous inputs (which can be in another path)
+                            if (t_is_select) task_subseq[&t] = { node_commute_son, ssid };
                             is_last = false;
                             last_subseq = Sequence::init_recursive<SS, TA>(task_subseq[&t].first,
                                                                            task_subseq[&t].second,
@@ -1728,6 +1733,9 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
                                                                   t.get_n_static_input_sockets()) ||
                         (t_is_select && t.is_last_input_socket(*bs)))
                     {
+                        // a 'select' reached by its last input follows the path being explored, not the
+                        // sub-sequence recorded for its previous inputs (which can be in another path)
+                        if (t_is_select) task_subseq[&t] = { node_commute, ssid };
                         is_last = false;
                         last_subseq = Sequence::init_recursive<SS, TA>(task_subseq[&t].first,
                                                                        task_subseq[&t].second,
@@ -1762,9 +1770,12 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
                 node_selector = new tools::Digraph_node<SS>({ cur_subseq }, {}, nullptr, cur_subseq->get_depth() + 1);
                 selectors.push_back({ &current_task, node_selector });
             }
+            else
+                node_selector->add_parent(cur_subseq); // the path of the last input is a parent too
 
             node_selector->set_contents(new SS());
             node_selector->get_c()->tasks.push_back(&current_task);
+            current_task_id = taid;
             node_selector->get_c()->tasks_id.push_back(taid++);
             node_selector->get_c()->type = subseq_t::SELECT;
             ssid++;
@@ -1801,6 +1812,9 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
                                                                       t.get_n_static_input_sockets()) ||
                             (t_is_select && t.is_last_input_socket(*bs)))
                         {
+                            // a 'select' reached by its last input follows the path being explored, not the
+                            // sub-sequence recorded for its previous inputs (which can be in another path)
+                            if (t_is_select) task_subseq[&t] = { node_selector_son, ssid };
                             is_last = false;
                             last_subseq = Sequence::init_recursive<SS, TA>(task_subseq[&t].first,
                                                                            task_subseq[&t].second,
@@ -1832,7 +1846,8 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
                                   { node_selector_son }, {}, nullptr, node_selector_son->get_depth() + 1);
                                 selectors.push_back({ &t, node_selector });
                             }
-                            node_selector->add_parent(node_selector_son);
+                            else
+                                node_selector->add_parent(node_selector_son);
                             node_selector_son->add_child(node_selector);
                         }
                     }
@@ -1843,6 +1858,7 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
     else // --------------------------------------------------------------------------------------------- STANDARD CASE
     {
         cur_subseq->get_c()->tasks.push_back(&current_task);
+        current_task_id = taid;
         cur_subseq->get_c()->tasks_id.push_back(taid++);
 
         if (std::find(lasts.begin(), lasts.end(), &current_task) == lasts.end())
@@ -1870,6 +1886,9 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
                                                           t.get_n_static_input_sockets()) ||
                                 (t_is_select && t.is_last_input_socket(*bs)))
                             {
+                                // a 'select' reached by its last input follows the path being explored, not the
+                                // sub-sequence recorded for its previous inputs (which can be in another path)
+                                if (t_is_select) task_subseq[&t] = { cur_subseq, ssid };
                                 is_last = false;
                                 last_subseq = Sequence::init_recursive<SS, TA>(task_subseq[&t].first,
                                                                                task_subseq[&t].second,
@@ -1901,7 +1920,8 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
                                       { cur_subseq }, {}, nullptr, cur_subseq->get_depth() + 1);
                                     selectors.push_back({ &t, node_selector });
                                 }
-                                node_selector->add_parent(cur_subseq);
+                                else
+                                    node_selector->add_parent(cur_subseq);
                                 cur_subseq->add_child(node_selector);
                             }
                         }
@@ -1932,7 +1952,9 @@ Sequence::init_recursive(tools::Digraph_node<SS>* cur_subseq,
     if (is_last && std::find(real_lasts.begin(), real_lasts.end(), &current_task) == real_lasts.end())
     {
         real_lasts.push_back(&current_task);
-        real_lasts_id.push_back(cur_subseq->get_contents()->tasks_id.back());
+        // the id of 'current_task' itself: a 'select' is not in 'cur_subseq' (the sub-sequence of the path that
+        // reached it, which can be empty, e.g. the exit of a loop)
+        real_lasts_id.push_back(current_task_id);
     }
 
     if (last_subseq)
